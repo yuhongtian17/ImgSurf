@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+MODEL_PATH="/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct" \
+OUTPUT_ROOT="/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen3_8b" \
+TOTAL_GPUS=8 \
+ROLLOUT_TP_SIZE=4 \
+ROLLOUT_GPU_MEMORY_UTILIZATION=0.50 \
+ROLLOUT_N=8 \
+AGENT_WORKERS=1 \
+IMGSURF_MAX_INPUT_PIXELS=4194304 \
+FULL_DATASET=1 \
+TOTAL_EPOCHS=1 \
+bash ./recipe/imgsurf/run_imgsurf_grpo.sh

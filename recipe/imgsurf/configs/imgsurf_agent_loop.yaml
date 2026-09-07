@@ -1,0 +1,2 @@
+- name: imgsurf_tool_agent
+  _target_: recipe.imgsurf.imgsurf_agent_loop.ImgSurfToolAgentLoop

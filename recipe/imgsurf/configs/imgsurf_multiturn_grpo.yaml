@@ -1,0 +1,116 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # The rollout context must be at least the sum of these two limits.
+  max_prompt_length: 6144
+  max_response_length: 2048
+  train_batch_size: 32
+  return_raw_chat: true
+  return_multi_modal_inputs: false
+  filter_overlong_prompts: false
+  truncation: error
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  custom_cls:
+    path: recipe/imgsurf/imgsurf.py
+    name: CustomRLHFDataset
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    use_remove_padding: false
+    use_fused_kernels: false
+    enable_gradient_checkpointing: true
+    trust_remote_code: false
+  actor:
+    strategy: fsdp
+    use_torch_compile: false
+    use_kl_loss: false
+    entropy_coeff: 0.0
+    ulysses_sequence_parallel_size: 1
+    # Static actor defaults live here. The launcher only overrides values that
+    # depend on the requested resource topology or were explicitly supplied by
+    # the caller.
+    optim:
+      lr: 1.0e-6
+    ppo_micro_batch_size_per_gpu: 1
+    # Keep the dynamic-batching token budget synchronized with the SGLang
+    # context limit. Changing rollout.max_model_len now updates both settings.
+    ppo_max_token_len_per_gpu: ${actor_rollout_ref.rollout.max_model_len}
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  ref:
+    strategy: fsdp
+  rollout:
+    name: sglang
+    mode: async
+    dtype: bfloat16
+    tensor_model_parallel_size: 1
+    n: 8
+    temperature: 1.0
+    top_p: 1.0
+    log_prob_micro_batch_size_per_gpu: 1
+    # This is the single source of truth for the rollout context limit.
+    # It must be >= data.max_prompt_length + data.max_response_length.
+    max_model_len: 8192
+    # With chunked prefill enabled this may be lower than max_model_len; keeping
+    # it separate avoids increasing rollout memory merely to extend context.
+    max_num_batched_tokens: 8192
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.50
+    enforce_eager: true
+    free_cache_engine: true
+    enable_chunked_prefill: true
+    engine_kwargs:
+      sglang:
+        attention_backend: flashinfer
+    agent:
+      num_workers: 8
+      agent_loop_config_path: recipe/imgsurf/configs/imgsurf_agent_loop.yaml
+    multi_turn:
+      enable: true
+      max_assistant_turns: 3
+      max_user_turns: 2
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      tool_config_path: recipe/imgsurf/configs/imgsurf_zoom_tool.yaml
+      format: hermes
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  norm_adv_by_std_in_grpo: true
+  kl_ctrl:
+    kl_coef: 0.0
+
+custom_reward_function:
+  path: recipe/imgsurf/imgsurf.py
+  name: compute_score
+
+reward_model:
+  # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),
+  # so no local GPU reward-model worker is allocated.
+  enable: false
+  reward_manager: naive
+  launch_reward_fn_async: false
+
+trainer:
+  critic_warmup: 0
+  val_before_train: false
+  test_freq: -1
+  logger: [console, tensorboard]
+  # Resource topology is always supplied by run_imgsurf_grpo.sh.
+  n_gpus_per_node: 8
+  nnodes: 1
+  # Static training defaults can be edited here or overridden at launch time.
+  save_freq: 100
+  resume_mode: auto
+  total_epochs: 1
