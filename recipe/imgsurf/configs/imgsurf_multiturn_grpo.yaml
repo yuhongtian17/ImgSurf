@@ -8,8 +8,8 @@ defaults:
 
 data:
   # The rollout context must be at least the sum of these two limits.
-  max_prompt_length: 6144
-  max_response_length: 2048
+  max_prompt_length: 8192
+  max_response_length: 8192
   train_batch_size: 32
   return_raw_chat: true
   return_multi_modal_inputs: false
@@ -34,9 +34,8 @@ actor_rollout_ref:
     use_kl_loss: false
     entropy_coeff: 0.0
     ulysses_sequence_parallel_size: 1
-    # Static actor defaults live here. The launcher only overrides values that
-    # depend on the requested resource topology or were explicitly supplied by
-    # the caller.
+    # Fallbacks for direct Hydra invocation. The launcher supplies its own
+    # documented defaults so launcher flags/env always take precedence here.
     optim:
       lr: 1.0e-6
     ppo_micro_batch_size_per_gpu: 1
@@ -59,9 +58,9 @@ actor_rollout_ref:
     log_prob_micro_batch_size_per_gpu: 1
     # This is the single source of truth for the rollout context limit.
     # It must be >= data.max_prompt_length + data.max_response_length.
-    max_model_len: 8192
-    # With chunked prefill enabled this may be lower than max_model_len; keeping
-    # it separate avoids increasing rollout memory merely to extend context.
+    max_model_len: 16384
+    # With chunked prefill enabled this may be lower than max_model_len. The
+    # launcher exposes it separately as --max-batched-tokens.
     max_num_batched_tokens: 8192
     max_num_seqs: 8
     gpu_memory_utilization: 0.50
@@ -76,13 +75,17 @@ actor_rollout_ref:
       agent_loop_config_path: recipe/imgsurf/configs/imgsurf_agent_loop.yaml
     multi_turn:
       enable: true
-      max_assistant_turns: 3
-      max_user_turns: 2
+      max_assistant_turns: 10
+      max_user_turns: 9
       max_parallel_calls: 1
       max_tool_response_length: 256
       tool_response_truncate_side: middle
       tool_config_path: recipe/imgsurf/configs/imgsurf_zoom_tool.yaml
       format: hermes
+      imgsurf_reward_token: ${oc.env:IMGSURF_REWARD_TOKEN,all}
+      imgsurf_max_turn_tokens: ${oc.env:IMGSURF_MAX_TURN_TOKENS,1024}
+      imgsurf_min_final_tokens: ${oc.env:IMGSURF_MIN_FINAL_TOKENS,512}
+      imgsurf_max_think_summary_tokens: ${oc.env:IMGSURF_MAX_THINK_SUMMARY_TOKENS,512}
 
 algorithm:
   adv_estimator: grpo
@@ -94,12 +97,21 @@ algorithm:
 custom_reward_function:
   path: recipe/imgsurf/imgsurf.py
   name: compute_score
+  reward_kwargs:
+    semantic_reward: ${oc.env:IMGSURF_SEMANTIC_REWARD,rule}
+    consistency_reward: ${oc.env:IMGSURF_CONSISTENCY_REWARD,1}
+    accuracy_weight: ${oc.env:IMGSURF_ACCURACY_WEIGHT,1.0}
+    format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,0.05}
+    tool_weight: ${oc.env:IMGSURF_TOOL_WEIGHT,0.10}
+    consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,0.05}
+    invalid_tool_weight: ${oc.env:IMGSURF_INVALID_TOOL_WEIGHT,0.10}
+    excess_tool_weight: ${oc.env:IMGSURF_EXCESS_TOOL_WEIGHT,0.02}
 
 reward_model:
   # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),
   # so no local GPU reward-model worker is allocated.
   enable: false
-  reward_manager: naive
+  reward_manager: imgsurf
   launch_reward_fn_async: false
 
 trainer:
@@ -110,7 +122,7 @@ trainer:
   # Resource topology is always supplied by run_imgsurf_grpo.sh.
   n_gpus_per_node: 8
   nnodes: 1
-  # Static training defaults can be edited here or overridden at launch time.
+  # Launcher flags/env override these YAML fallbacks.
   save_freq: 100
   resume_mode: auto
   total_epochs: 1

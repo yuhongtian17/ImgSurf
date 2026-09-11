@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-MODEL_PATH="/home/dataset-assist-0/workspace/deepeyes271/Qwen2.5-VL-7B-Instruct" \
-OUTPUT_ROOT="/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b" \
-TOTAL_GPUS=8 \
-ROLLOUT_TP_SIZE=4 \
-ROLLOUT_GPU_MEMORY_UTILIZATION=0.50 \
-ROLLOUT_N=8 \
-AGENT_WORKERS=1 \
-IMGSURF_MAX_INPUT_PIXELS=4194304 \
-FULL_DATASET=1 \
-TOTAL_EPOCHS=1 \
-bash ./recipe/imgsurf/run_imgsurf_grpo.sh
+bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
+  --model-path=/home/dataset-assist-0/workspace/deepeyes271/Qwen2.5-VL-7B-Instruct \
+  --output-root=/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b \
+  --total-gpus=8 \
+  --rollout-tp-size=4 \
+  --rollout-gpu-memory-utilization=0.50 \
+  --rollout-n=8 \
+  --agent-workers=1 \
+  --max-input-pixels=4194304 \
+  --full-dataset=on \
+  --total-epochs=1 \
+  "$@"

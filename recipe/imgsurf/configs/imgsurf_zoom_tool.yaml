@@ -1,21 +1,23 @@
 tools:
   - class_name: verl.tools.imgsurf_zoom_tool.ImgSurfZoomTool
     config:
-      coordinate_scale: 1000
-      max_iter: 4
-      expand_ratio: 0.4
-      iou_threshold: 0.5
-      resize_factor: 32
-      min_pixels: 1024
-      max_pixels: 4194304
+      k: ${oc.env:IMGSURF_K,0.4}
+      max_iter: ${oc.env:IMGSURF_MAX_ITER,4}
+      max_level: ${oc.env:IMGSURF_MAX_LEVEL,1}
+      iou_threshold: ${oc.env:IMGSURF_IOU_THR,0.5}
+      expand_mode: ${oc.env:IMGSURF_EXPAND_MODE,quarter}
+      resize_factor_qwen3: 32
+      resize_factor_qwen2: 28
+      min_pixels: ${oc.env:IMGSURF_MIN_TOOL_PIXELS,4096}
+      max_pixels: ${oc.env:IMGSURF_MAX_TOOL_PIXELS,4194304}
       type: native
     tool_schema:
       type: function
       function:
         name: image_zoom_in_tool
         description: >-
-          Select and recursively refine a region needed to answer the question. Coordinates are
-          normalized to [0,1000] relative to the original image; the tool returns the final crop.
+          Select and recursively refine a region needed to answer the question. Qwen3-VL uses
+          [0,1000] coordinates; Qwen2.5-VL uses the displayed image width and height.
         parameters:
           type: object
           properties:
@@ -25,8 +27,8 @@ tools:
                 type: number
               minItems: 4
               maxItems: 4
-              description: Normalized [x1,y1,x2,y2] in the original image, each value in [0,1000].
+              description: Ordered [x1,y1,x2,y2] relative to the image currently shown.
             label:
               type: string
               description: Short name of the object or evidence to inspect.
-          required: [bbox_2d]
+          required: [bbox_2d, label]

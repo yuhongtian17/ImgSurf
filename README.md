@@ -191,7 +191,7 @@ bash train_qwen25_7b.sh
 
 python -m verl.model_merger merge \
     --backend fsdp \
-    --local_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen3_8b/ckpts/grpo-8gpu-1node/global_step_1470/actor/" \
-    --target_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen3_8b/merged/"
+    --local_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b/ckpts/grpo-8gpu-1node/global_step_1470/actor/" \
+    --target_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b/merged/"
 ```
 
