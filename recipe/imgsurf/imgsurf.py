@@ -17,7 +17,12 @@ from typing import Any
 from PIL import Image
 
 import verl.utils.torch_functional as verl_F
-from recipe.imgsurf.prompt_utils import build_initial_user_text, build_system_prompt, render_imgsurf_chat_prompt
+from recipe.imgsurf.prompt_utils import (
+    build_initial_user_text,
+    build_system_prompt,
+    render_imgsurf_chat_prompt,
+    response_format_is_valid,
+)
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 logger = logging.getLogger(__name__)
@@ -453,8 +458,8 @@ def _judge_semantic(question: str, ground_truth: str, prediction: str, image_dat
 
 
 def _syntactic_tool_metadata(solution: str) -> dict[str, Any]:
-    all_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", solution, flags=re.DOTALL)
-    unclosed = max(0, solution.count("<tool_call>") - len(all_blocks))
+    all_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", solution, flags=re.DOTALL | re.IGNORECASE)
+    unclosed = max(0, solution.lower().count("<tool_call>") - len(all_blocks))
     attempts = unclosed
     valid = 0
     invalid = unclosed
@@ -488,8 +493,51 @@ def _syntactic_tool_metadata(solution: str) -> dict[str, Any]:
         "parsed_tool_calls": valid,
         "successful_tool_calls": valid,
         "invalid_tool_calls": invalid,
+        "tool_validity_scores": [1] * valid + [0] * invalid,
         "converged": bool(re.search(r"\bconverged\s*=\s*true\b", solution, flags=re.IGNORECASE)),
+        "initial_zoom_in_parsed": bool(valid),
+        "iteration_idx": None,
+        "len_k_list": 0,
     }
+
+
+def _syntactic_format_scores(solution: str) -> list[int]:
+    """Fallback format score for callers that do not have rollout metadata."""
+
+    if not isinstance(solution, str) or not solution.strip():
+        return [0]
+    think_blocks = list(re.finditer(r"<think>.*?</think>", solution, flags=re.DOTALL | re.IGNORECASE))
+    if not think_blocks:
+        return [0]
+    scores: list[int] = []
+    for index, match in enumerate(think_blocks):
+        end = think_blocks[index + 1].start() if index + 1 < len(think_blocks) else len(solution)
+        response = solution[match.start() : end].strip()
+        kind = "final" if re.search(r"<answer>", response, flags=re.IGNORECASE) else (
+            "initial" if index == 0 else "refinement"
+        )
+        scores.append(int(response_format_is_valid(response, kind)))
+    return scores
+
+
+def _mean_binary(values: Any, default: float = 0.0) -> float:
+    if values is None:
+        return float(default)
+    if isinstance(values, (str, bytes)):
+        values = [values]
+    try:
+        values = list(values)
+    except TypeError:
+        values = [values]
+    if not values:
+        return float(default)
+    normalized = []
+    for value in values:
+        try:
+            normalized.append(float(float(value) > 0.5))
+        except (TypeError, ValueError):
+            normalized.append(0.0)
+    return float(sum(normalized) / len(normalized))
 
 
 def _as_bool(value: Any) -> bool:
@@ -504,31 +552,25 @@ def compute_score(
     semantic_reward: str = "rule",
     consistency_reward: Any = "1",
     accuracy_weight: float = 1.0,
-    format_weight: float = 0.05,
+    format_weight: float = 0.10,
     tool_weight: float = 0.10,
-    consistency_weight: float = 0.05,
-    invalid_tool_weight: float = 0.10,
-    excess_tool_weight: float = 0.02,
+    consistency_weight: float = 0.10,
+    iteration_weight: float = 0.05,
 ) -> dict[str, float]:
-    """Accuracy-first reward with trusted parse/execution and consistency signals."""
+    """Compute the ImgSurf reward from per-response and per-call averages.
+
+    ``response_format_scores``, ``tool_validity_scores``, ``iteration_idx`` and
+    ``len_k_list`` are emitted by the agent loop. A syntactic fallback keeps
+    offline evaluation useful when a caller supplies only a response string.
+    """
 
     extra_info = extra_info or {}
     accuracy_weight = float(accuracy_weight)
     format_weight = float(format_weight)
     tool_weight = float(tool_weight)
     consistency_weight = float(consistency_weight)
-    invalid_tool_weight = float(invalid_tool_weight)
-    excess_tool_weight = float(excess_tool_weight)
-    answer, answer_format_ok = _extract_answer(solution_str)
-    think_open = solution_str.count("<think>")
-    tag_format_ok = (
-        think_open > 0
-        and think_open == solution_str.count("</think>")
-        and solution_str.count("<tool_call>") == solution_str.count("</tool_call>")
-        and len(answer) <= 1000
-    )
-    format_raw = 1.0 if answer_format_ok and tag_format_ok else -1.0
-
+    iteration_weight = float(iteration_weight)
+    answer, _ = _extract_answer(solution_str)
     source = str(data_source).lower()
     is_math = "thinklite" in source or str(extra_info.get("ability", "")).lower() == "math"
     if is_math:
@@ -556,39 +598,57 @@ def compute_score(
         visual_source = True
 
     metadata = extra_info.get("imgsurf_reward_metadata") or _syntactic_tool_metadata(solution_str)
+    format_scores = metadata.get("response_format_scores")
+    if format_scores is None:
+        format_scores = _syntactic_format_scores(solution_str)
+    format_average = _mean_binary(format_scores)
     attempts = int(metadata.get("tool_attempts", 0))
     parsed = int(metadata.get("parsed_tool_calls", 0))
     successful = int(metadata.get("successful_tool_calls", 0))
     invalid = int(metadata.get("invalid_tool_calls", max(0, attempts - parsed)))
-    valid_tool = float(attempts > 0 and invalid == 0 and parsed == attempts and successful == parsed)
-    tool_parse = float(visual_source and valid_tool > 0.5)
-    consistency = float(
-        _as_bool(consistency_reward)
-        and visual_source
-        and valid_tool > 0.5
-        and bool(metadata.get("converged", False))
-    )
-    allowed_calls = int(metadata.get("expected_max_tool_calls", max(2, attempts)))
-    excess = max(0, attempts - allowed_calls)
+    tool_scores = metadata.get("tool_validity_scores")
+    if tool_scores is None:
+        tool_scores = [1] * successful + [0] * max(0, attempts - successful)
+    # There is no tool obligation when the model answers directly.  Keep this
+    # component neutral for non-visual/math examples and zero for a visual
+    # response with no image_zoom_in_tool call.
+    tool_average = _mean_binary(tool_scores, default=0.0)
+    tool_parse = float(visual_source and tool_average)
+    consistency = float(_as_bool(consistency_reward) and visual_source and bool(metadata.get("converged", False)))
+    iteration_idx = metadata.get("iteration_idx")
+    len_k_list = int(metadata.get("len_k_list", 0) or 0)
+    reward_iter = 0.0
+    if metadata.get("initial_zoom_in_parsed", False) and iteration_idx is not None:
+        try:
+            iteration_idx = int(iteration_idx)
+        except (TypeError, ValueError):
+            iteration_idx = None
+        if iteration_idx is not None and len_k_list > 0 and 0 <= iteration_idx < len_k_list:
+            reward_iter = (len_k_list - 1 - iteration_idx) / max(1, len_k_list - 1)
 
     score = (
         accuracy_weight * accuracy
-        + format_weight * format_raw
+        + format_weight * format_average
         + tool_weight * tool_parse
         + consistency_weight * consistency
-        - invalid_tool_weight * min(invalid, 2)
-        - excess_tool_weight * excess
+        + iteration_weight * reward_iter
     )
-    score = max(-0.2, min(1.2, score))
     return {
         "score": float(score),
         "accuracy": accuracy,
-        "format": format_raw,
-        "valid_tool": valid_tool,
+        "format": format_average,
+        "format_average": format_average,
+        "tool": tool_average,
+        "valid_tool": tool_average,
+        "tool_average": tool_average,
         "tool_parse": tool_parse,
         "invalid_tool_calls": float(invalid),
         "consistency": consistency,
         "tool_calls": float(attempts),
+        "reward_iter": float(reward_iter),
+        "iteration_reward": float(reward_iter),
+        "iteration_idx": float(iteration_idx) if iteration_idx is not None else -1.0,
+        "len_k_list": float(len_k_list),
     }
 
 
@@ -599,8 +659,55 @@ if __name__ == "__main__":
     assert _rule_semantic_match("1.0", "1") is True
     assert _rule_semantic_match("4", "-4") is False
     assert _math_match("4", "-4") is False
-    valid = '<think>x</think><tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call><answer>B</answer>'
-    invalid = "<think>x</think><tool_call>{not-json}</tool_call><answer>B</answer>"
+    valid = '<think>x</think><tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call>'
+    invalid = '<think>x</think><tool_call>{not-json}</tool_call>'
     assert compute_score("chart", valid, "B")["valid_tool"] == 1.0
     assert compute_score("chart", invalid, "B")["valid_tool"] == 0.0
+    averaged = compute_score(
+        "chart",
+        "<think>x</think><answer>B</answer>",
+        "B",
+        extra_info={
+            "imgsurf_reward_metadata": {
+                "response_format_scores": [1, 0],
+                "tool_validity_scores": [1, 0],
+                "initial_zoom_in_parsed": True,
+                "iteration_idx": 0,
+                "len_k_list": 4,
+                "converged": True,
+            }
+        },
+    )
+    assert averaged["format"] == 0.5 and averaged["tool"] == 0.5
+    assert averaged["reward_iter"] == 1.0
+    late = compute_score(
+        "chart",
+        "<think>x</think><answer>B</answer>",
+        "B",
+        extra_info={
+            "imgsurf_reward_metadata": {
+                "response_format_scores": [1],
+                "tool_validity_scores": [],
+                "initial_zoom_in_parsed": True,
+                "iteration_idx": 7,
+                "len_k_list": 8,
+            }
+        },
+    )
+    assert late["reward_iter"] == 0.0
+    middle = compute_score(
+        "chart",
+        "<think>x</think><answer>B</answer>",
+        "B",
+        extra_info={
+            "imgsurf_reward_metadata": {
+                "initial_zoom_in_parsed": True,
+                "iteration_idx": 3,
+                "len_k_list": 8,
+            }
+        },
+    )
+    assert middle["reward_iter"] == 4 / 7
+    no_loop = compute_score("chart", "<think>x</think><answer>B</answer>", "B")
+    assert no_loop["reward_iter"] == 0.0
     print("ImgSurf reward smoke tests passed")

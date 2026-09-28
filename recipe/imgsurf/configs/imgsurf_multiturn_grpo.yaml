@@ -101,11 +101,10 @@ custom_reward_function:
     semantic_reward: ${oc.env:IMGSURF_SEMANTIC_REWARD,rule}
     consistency_reward: ${oc.env:IMGSURF_CONSISTENCY_REWARD,1}
     accuracy_weight: ${oc.env:IMGSURF_ACCURACY_WEIGHT,1.0}
-    format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,0.05}
+    format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,0.10}
     tool_weight: ${oc.env:IMGSURF_TOOL_WEIGHT,0.10}
-    consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,0.05}
-    invalid_tool_weight: ${oc.env:IMGSURF_INVALID_TOOL_WEIGHT,0.10}
-    excess_tool_weight: ${oc.env:IMGSURF_EXCESS_TOOL_WEIGHT,0.02}
+    consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,0.10}
+    iteration_weight: ${oc.env:IMGSURF_ITERATION_WEIGHT,0.05}
 
 reward_model:
   # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),

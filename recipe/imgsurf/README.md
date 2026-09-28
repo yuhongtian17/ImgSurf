@@ -9,7 +9,9 @@ cp -r ./ImgSurf-dev/* ./SCAgent-main/
 cd ./SCAgent-main
 ```
 
-当前实现把 `eval/deepeyes/eval_hrbench_v4.py` 的主要轨迹变成可重放的 GRPO 多轮序列：
+当前实现把 `eval/deepeyes/eval_hrbench_v4.py` 的主要轨迹变成可重放的 GRPO 多轮序列，训练时使用与
+`eval_*_v4.py` 对齐的 system/tool XML、初始请求、`I{n}` zoom-out 观察、`R{n}` refinement 请求和
+最终 `<tool_response>` 裁剪图请求：
 
 1. 模型看初始图，决定是否输出 `image_zoom_in_tool`；
 2. 工具保留原图，按 `k` 和 `expand_mode` 产生扩展区域；
@@ -18,7 +20,8 @@ cd ./SCAgent-main
 5. 新旧区域 IoU 大于 `iou_thr` 时收敛，否则在 `max_iter * max_level` 次内继续；
 6. 模型读取最终裁剪和最近两段思考，输出唯一的 `<answer>...</answer>`。
 
-工具始终使用数据集原图做坐标映射，不会在已经缩小的初始输入图上重复裁剪。
+工具始终使用数据集原图做坐标映射，不会在已经缩小的初始输入图上重复裁剪。训练会在渲染初始
+多模态 prompt 后检查 token 数；超过 `max_prompt_length` 会立即报错，避免把超长 prompt 静默送入 rollout。
 
 ## 训练环境
 
@@ -91,17 +94,25 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 较宽松的规则而造成奖励口径漂移。真实 API key 用命令行传入时会留在 shell 历史中；敏感环境下可继续
 使用兼容的 `IMGSURF_JUDGE_API_KEY` 环境变量。
 
-## 工具与一致性奖励
+## 格式、工具与一致性奖励
 
-工具调用只有同时满足以下条件才算可解析：
+每次策略 response 单独计算格式分数，合法为 `1`，非法为 `0`，最后对所有 response 取平均。初始
+response 必须是 `<think>...</think>` 加一个工具调用或最终回答；每个 refinement response 必须是
+`<think>...</think><tool_call>...</tool_call>`；最终 response 必须是
+`<think>...</think><answer>...</answer>`。标签外文本、缺失标签、空思考/答案和超过该轮 token 上限都会使
+该 response 的格式分数为 `0`。
+
+每个 `image_zoom_in_tool` 调用单独计算工具分数，合法为 `1`，非法为 `0`，对所有调用取平均。合法调用
+必须同时满足以下条件：
 
 - `<tool_call>` 内是合法 JSON；
 - 函数名是 `image_zoom_in_tool`；
 - `bbox_2d` 是四个有限数，满足 `x1 < x2`、`y1 < y2` 且位于当前坐标范围；
 - `label` 是非空字符串。
 
-工具奖励不评价 bbox 与目标的重叠质量。bbox 内容由最终任务准确率和可选一致性信号间接约束；非法
-或无法解析的调用另有负奖励。
+没有必须调用工具的直接回答不额外扣工具分；需要 refinement 但没有合法 `<tool_call>` 的 response
+会贡献一个 `0`。没有任何 `image_zoom_in_tool` 调用时工具平均值定义为 `0`，只是不产生工具加分。
+工具奖励不评价 bbox 与目标的重叠质量，bbox 内容由最终任务准确率和一致性信号间接约束。
 
 默认开启一致性奖励：只要合法的迭代轨迹在次数上限内达到 `IoU > iou_thr`，就增加奖励。关闭方式：
 
@@ -109,22 +120,32 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 bash ./recipe/imgsurf/run_imgsurf_grpo.sh --consistency-reward off
 ```
 
+一致性分数在合法 refinement 最终达到 `IoU > iou_thr` 时为 `1`，否则为 `0`。定位循环结束时，
+根据展平后的 `k_list` 轮次编号 `iter_idx` 计算正向轮次奖励。令
+`len_k_list = max_iter * max_level`，则 `iter_idx=0,1,...,len_k_list-1`：
+
+```text
+reward_iter = (len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
+```
+
+因此越早达到一致性、或越早结束循环，奖励越高；达到最后一轮时为 `0`。没有解析到初始
+`image_zoom_in_tool` 区域、没有进入定位循环时，`reward_iter=0`。
+当 `len_k_list=1` 时分母按 `1` 处理，因此唯一轮次的奖励为 `0`。
+
 当前总奖励为：
 
 ```text
-R = clip(
-      1.00 * accuracy
-    + 0.05 * format                 # 合法为 +1，非法为 -1
-    + 0.10 * valid_tool_parse       # 仅视觉数据，且整条策略工具轨迹可解析
-    + 0.05 * consistency
-    - 0.10 * min(invalid_calls, 2)
-    - 0.02 * excess_calls,
-    -0.2, 1.2)
+R = accuracy_weight * accuracy
+  + format_weight * mean(response_format_scores)
+  + tool_weight * mean(tool_validity_scores)
+  + consistency_weight * consistency
+  + iteration_weight * reward_iter
 ```
 
-准确率仍是绝对主信号；格式、工具解析和一致性的合计不足以让错误答案接近正确答案。权重可通过
-`--accuracy-weight`、`--format-weight`、`--tool-weight`、`--consistency-weight`、
-`--invalid-tool-weight` 和 `--excess-tool-weight` 调整。
+默认权重为 `accuracy=1.0`、`format=0.10`、`tool=0.10`、`consistency=0.10`、
+`iteration=0.05`。准确率仍是主信号；格式、工具和轮次分数都属于 `[0,1]`，不再使用负向轮次
+惩罚。权重可通过 `--accuracy-weight`、`--format-weight`、`--tool-weight`、
+`--consistency-weight` 和 `--iteration-weight` 调整。
 
 ## v4 超参数
 

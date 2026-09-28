@@ -22,6 +22,7 @@ from recipe.imgsurf.prompt_utils import (
     build_final_user_text,
     build_refine_user_text,
     render_imgsurf_chat_prompt,
+    response_format_is_valid,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, AgentLoopWorker, register
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
@@ -231,11 +232,49 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         instance_id: str,
         metadata: dict[str, Any],
         required: bool,
+        response_kind: str,
     ) -> tuple[list[dict[str, Any]], str]:
         text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        textual_attempts = text.count("<tool_call>")
+        metadata.setdefault("response_format_scores", []).append(
+            int(
+                response_format_is_valid(
+                    text,
+                    response_kind,
+                    token_count=len(response_ids),
+                    max_tokens=self.max_turn_tokens,
+                )
+            )
+        )
+        metadata.setdefault("response_kinds", []).append(response_kind)
+
+        # Count only policy image_zoom_in_tool calls.  The synthetic
+        # image_zoom_out_tool call is an environment observation and must not
+        # dilute the tool-validity average.
+        raw_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL | re.IGNORECASE)
+        unclosed = max(0, text.lower().count("<tool_call>") - len(raw_blocks))
+        textual_attempts = unclosed
+        for block in raw_blocks:
+            try:
+                payload = json.loads(block)
+                if isinstance(payload, dict) and payload.get("name") == "image_zoom_out_tool":
+                    continue
+            except Exception:
+                pass
+            textual_attempts += 1
         _, calls = await self.tool_parser.extract_tool_calls(response_ids)
-        attempts = max(textual_attempts, len(calls))
+        parsed_policy_calls = sum(1 for call in calls if call.name != "image_zoom_out_tool")
+        attempts = max(textual_attempts, parsed_policy_calls)
+        valid_raw_calls = 0
+        for block in raw_blocks:
+            try:
+                payload = json.loads(block)
+                if not isinstance(payload, dict) or payload.get("name") != "image_zoom_in_tool":
+                    continue
+                arguments = payload.get("arguments")
+                if isinstance(arguments, dict) and tool.validate_parameters(instance_id, arguments)[0]:
+                    valid_raw_calls += 1
+            except Exception:
+                continue
         valid_arguments: list[dict[str, Any]] = []
         for call in calls:
             try:
@@ -253,11 +292,18 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         # invalid attempt; an optional initial/final answer may use no tool.
         if required and attempts == 0:
             attempts = 1
-        invalid = max(0, attempts - len(valid_arguments))
+        # A parser-only call without a literal <tool_call> envelope is not a
+        # legal response-format/tool attempt, even if the backend parser
+        # happens to recover arguments from the token stream.
+        valid_count = min(attempts, max(valid_raw_calls, len(valid_arguments))) if textual_attempts else 0
+        invalid = max(0, attempts - valid_count)
         metadata["tool_attempts"] += attempts
-        metadata["parsed_tool_calls"] += len(valid_arguments)
-        metadata["successful_tool_calls"] += len(valid_arguments)
+        metadata["parsed_tool_calls"] += valid_count
+        metadata["successful_tool_calls"] += valid_count
         metadata["invalid_tool_calls"] += invalid
+        metadata.setdefault("tool_validity_scores", []).extend(
+            [1] * valid_count + [0] * max(0, attempts - valid_count)
+        )
         return valid_arguments, text
 
     def _think_summary(self, think_blocks: list[str]) -> str:
@@ -297,9 +343,13 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             "parsed_tool_calls": 0,
             "successful_tool_calls": 0,
             "invalid_tool_calls": 0,
+            "response_format_scores": [],
+            "response_kinds": [],
+            "tool_validity_scores": [],
+            "initial_zoom_in_parsed": False,
+            "iteration_idx": None,
+            "len_k_list": int(tool.max_iter) * int(getattr(tool, "max_level", 1)),
             "converged": False,
-            "iterations": 0,
-            "expected_max_tool_calls": 1 + tool.max_iter * tool.max_level,
             "reward_token": self.reward_token,
             "context_truncated": False,
         }
@@ -321,10 +371,18 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 reserve=self.final_turn_reserve,
             )
             assistant_turns += 1
+            initial_attempts_before = metadata["tool_attempts"]
             initial_calls, initial_text = await self._parse_calls(
-                initial_ids, tool, instance_id, metadata, required=False
+                initial_ids, tool, instance_id, metadata, required=False, response_kind="initial"
             )
             already_answered = bool(re.search(r"<answer>\s*.+?\s*</answer>", initial_text, re.DOTALL | re.IGNORECASE))
+            if not initial_calls and not already_answered and metadata["tool_attempts"] == initial_attempts_before:
+                # The initial turn may answer directly, but a response that
+                # does neither an answer nor a tool call is an invalid tool
+                # attempt and contributes a zero to the tool average.
+                metadata["tool_attempts"] += 1
+                metadata["invalid_tool_calls"] += 1
+                metadata.setdefault("tool_validity_scores", []).append(0)
             first_think = _extract_think(initial_text)
             if first_think:
                 think_blocks.append(first_think)
@@ -332,6 +390,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             observation = None
             observation_meta: dict[str, Any] = {}
             if initial_calls and not already_answered:
+                metadata["initial_zoom_in_parsed"] = True
                 with simple_timer("tool_calls", metrics):
                     observation, _, observation_meta = await tool.execute(instance_id, initial_calls[0])
 
@@ -345,7 +404,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                     {
                         "role": "user",
                         "content": (
-                            f"Call **image_zoom_out_tool** to output I{index}, whose area is approximately "
+                            f"Centered around R{index}, call **image_zoom_out_tool** to output I{index}, whose area is approximately "
                             f"{float(observation_meta['k_level']) ** 2:.6g} times that of the original image."
                         ),
                     },
@@ -409,7 +468,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 )
                 assistant_turns += 2  # generated zoom-in plus scripted zoom-out
                 calls, inner_text = await self._parse_calls(
-                    inner_ids, tool, instance_id, metadata, required=True
+                    inner_ids, tool, instance_id, metadata, required=True, response_kind="refinement"
                 )
                 thought = _extract_think(inner_text)
                 if thought:
@@ -419,7 +478,12 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                         observation, _, observation_meta = await tool.execute(instance_id, calls[0])
                     else:
                         observation, _, observation_meta = await tool.fallback_after_invalid_refinement(instance_id)
-                metadata["iterations"] = int(observation_meta.get("iterations", observation_meta.get("iteration", 0)))
+                completed_iterations = int(
+                    observation_meta.get("iterations", observation_meta.get("iteration", 0))
+                )
+                if completed_iterations > 0:
+                    # ``iterations`` counts the flattened k-list position.
+                    metadata["iteration_idx"] = completed_iterations - 1
                 metadata["converged"] = bool(observation_meta.get("converged", False))
 
             final_images = (
@@ -470,7 +534,14 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 assistant_turns += 1
                 # Final tool calls are not executed, but malformed JSON still
                 # contributes to the parseability reward.
-                await self._parse_calls(final_ids, tool, instance_id, metadata, required=False)
+                await self._parse_calls(
+                    final_ids,
+                    tool,
+                    instance_id,
+                    metadata,
+                    required=False,
+                    response_kind="final",
+                )
         finally:
             if instance_id is not None:
                 await tool.release(instance_id)

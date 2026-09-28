@@ -165,7 +165,7 @@ instruction_prompt_system = instruction_prompt_system_updated if bool(args.promp
 
 USER_PROMPT_STEP1 = "\nThink first, call **image_zoom_in_tool** if needed, then answer. Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>...</answer> "
 
-USER_PROMPT_CUSTOM = """Ignore all previous thinking. You are shown an image I{idx}. For the question and the given label, think and call **image_zoom_in_tool** to output exactly one rectangular crop region R{idx} (bbox_2d) that best matches the question and label. If you output multiple regions, only the first will be used. The bbox_2d coordinates must be relative to the image you see (I{idx}).
+USER_PROMPT_CUSTOM = """Ignore all previous thinking. You are shown an image I{I_idx}. For the question and the given label, think and call **image_zoom_in_tool** to output exactly one rectangular crop region R{R_idx} (bbox_2d) that best matches the question and label. If you output multiple regions, only the first will be used. The bbox_2d coordinates must be relative to the image you see (I{I_idx}).
 Format strictly as:  <think>...</think>  <tool_call>...</tool_call> """
 
 # USER_PROMPT_STEP10 = """Based on {content_m} give your final answer. Format strictly as:  <think>...</think>  <answer>...</answer> """
@@ -261,7 +261,7 @@ def run_zoom_loop_for_region(
                 ratio_w, ratio_h = 1, 1
             messages.append({
                 "role": "user", "content": [
-                    {"type": "text", "text": f"Call **image_zoom_out_tool** to output I{iter_idx+1}, whose area is approximately {k_level**2} times that of the original image."},
+                    {"type": "text", "text": f"Centered around R{iter_idx+1}, call **image_zoom_out_tool** to output I{iter_idx+1}, whose area is approximately {k_level**2} times that of the original image."},
                 ]
             })
             messages.append({
@@ -271,7 +271,7 @@ def run_zoom_loop_for_region(
             messages.append({
                 "role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_img}"}},
-                    {"type": "text", "text": q_opts + USER_PROMPT_CUSTOM.format(idx=iter_idx+1)},
+                    {"type": "text", "text": q_opts + USER_PROMPT_CUSTOM.format(I_idx=iter_idx+1, R_idx=iter_idx+2)},
                 ]
             })
             try:

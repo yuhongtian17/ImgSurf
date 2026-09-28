@@ -69,12 +69,11 @@ Token and image budgets:
   --max-tool-pixels INT             Maximum tool image pixels (default: 4194304)
 
 Reward weights:
-  --accuracy-weight FLOAT           Default: 1.0
-  --format-weight FLOAT             Default: 0.05
-  --tool-weight FLOAT               Default: 0.10
-  --consistency-weight FLOAT        Default: 0.05
-  --invalid-tool-weight FLOAT       Default: 0.10
-  --excess-tool-weight FLOAT        Default: 0.02
+  --accuracy-weight FLOAT           Answer correctness (default: 1.0)
+  --format-weight FLOAT             Mean response-format validity (default: 0.10)
+  --tool-weight FLOAT               Mean image_zoom_in validity (default: 0.10)
+  --consistency-weight FLOAT        Final localization convergence (default: 0.10)
+  --iteration-weight FLOAT          Early localization-loop reward (default: 0.05)
 
 VLM judge:
   --judge-base-url URL              Required when semantic-reward=judge
@@ -145,11 +144,10 @@ IMGSURF_MIN_TOOL_PIXELS=${IMGSURF_MIN_TOOL_PIXELS:-4096}
 IMGSURF_MAX_TOOL_PIXELS=${IMGSURF_MAX_TOOL_PIXELS:-4194304}
 
 IMGSURF_ACCURACY_WEIGHT=${IMGSURF_ACCURACY_WEIGHT:-1.0}
-IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-0.05}
+IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-0.10}
 IMGSURF_TOOL_WEIGHT=${IMGSURF_TOOL_WEIGHT:-0.10}
-IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-0.05}
-IMGSURF_INVALID_TOOL_WEIGHT=${IMGSURF_INVALID_TOOL_WEIGHT:-0.10}
-IMGSURF_EXCESS_TOOL_WEIGHT=${IMGSURF_EXCESS_TOOL_WEIGHT:-0.02}
+IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-0.10}
+IMGSURF_ITERATION_WEIGHT=${IMGSURF_ITERATION_WEIGHT:-0.05}
 
 IMGSURF_JUDGE_BASE_URL=${IMGSURF_JUDGE_BASE_URL:-}
 IMGSURF_JUDGE_MODEL=${IMGSURF_JUDGE_MODEL:-}
@@ -206,8 +204,7 @@ declare -A FLAG_TO_VARIABLE=(
   [--format-weight]=IMGSURF_FORMAT_WEIGHT
   [--tool-weight]=IMGSURF_TOOL_WEIGHT
   [--consistency-weight]=IMGSURF_CONSISTENCY_WEIGHT
-  [--invalid-tool-weight]=IMGSURF_INVALID_TOOL_WEIGHT
-  [--excess-tool-weight]=IMGSURF_EXCESS_TOOL_WEIGHT
+  [--iteration-weight]=IMGSURF_ITERATION_WEIGHT
   [--judge-base-url]=IMGSURF_JUDGE_BASE_URL
   [--judge-model]=IMGSURF_JUDGE_MODEL
   [--judge-api-key]=IMGSURF_JUDGE_API_KEY
@@ -322,7 +319,7 @@ check_float "${ROLLOUT_GPU_MEMORY_UTILIZATION}" '0 < x <= 1' '--rollout-gpu-memo
 check_float "${LEARNING_RATE}" 'x > 0' '--learning-rate must be positive'
 check_float "${IMGSURF_JUDGE_TIMEOUT}" 'x > 0' '--judge-timeout must be positive'
 for setting in IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT IMGSURF_TOOL_WEIGHT \
-  IMGSURF_CONSISTENCY_WEIGHT IMGSURF_INVALID_TOOL_WEIGHT IMGSURF_EXCESS_TOOL_WEIGHT; do
+  IMGSURF_CONSISTENCY_WEIGHT IMGSURF_ITERATION_WEIGHT; do
   check_float "${!setting}" 'x >= 0' "${setting} must be non-negative"
 done
 if [[ "${IMGSURF_SEMANTIC_REWARD}" == judge && -z "${IMGSURF_JUDGE_BASE_URL}" ]]; then
@@ -428,7 +425,7 @@ export IMGSURF_MAX_BATCHED_TOKENS IMGSURF_MAX_TURN_TOKENS IMGSURF_MIN_FINAL_TOKE
 export IMGSURF_MAX_THINK_SUMMARY_TOKENS IMGSURF_MAX_ASSISTANT_TURNS IMGSURF_MAX_USER_TURNS
 export IMGSURF_MAX_INPUT_PIXELS IMGSURF_MIN_TOOL_PIXELS IMGSURF_MAX_TOOL_PIXELS
 export IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT IMGSURF_TOOL_WEIGHT
-export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_INVALID_TOOL_WEIGHT IMGSURF_EXCESS_TOOL_WEIGHT
+export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_ITERATION_WEIGHT
 export IMGSURF_JUDGE_BASE_URL IMGSURF_JUDGE_MODEL IMGSURF_JUDGE_API_KEY
 export IMGSURF_JUDGE_TIMEOUT IMGSURF_JUDGE_MAX_RETRIES IMGSURF_JUDGE_MAX_PIXELS
 
