@@ -2,6 +2,8 @@
 # Licensed under the Apache License, Version 2.0
 """Stateful v4-style image refinement tool used by the ImgSurf agent loop."""
 
+from __future__ import annotations
+
 import math
 from typing import Any, Optional
 from uuid import uuid4

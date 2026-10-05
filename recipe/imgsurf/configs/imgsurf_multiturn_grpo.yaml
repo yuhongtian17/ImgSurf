@@ -10,7 +10,7 @@ data:
   # The rollout context must be at least the sum of these two limits.
   max_prompt_length: 8192
   max_response_length: 8192
-  train_batch_size: 32
+  train_batch_size: 64
   return_raw_chat: true
   return_multi_modal_inputs: false
   filter_overlong_prompts: false
@@ -39,6 +39,7 @@ actor_rollout_ref:
     optim:
       lr: 1.0e-6
     ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 32
     # Keep the dynamic-batching token budget synchronized with the SGLang
     # context limit. Changing rollout.max_model_len now updates both settings.
     ppo_max_token_len_per_gpu: ${actor_rollout_ref.rollout.max_model_len}
@@ -86,6 +87,8 @@ actor_rollout_ref:
       imgsurf_max_turn_tokens: ${oc.env:IMGSURF_MAX_TURN_TOKENS,1024}
       imgsurf_min_final_tokens: ${oc.env:IMGSURF_MIN_FINAL_TOKENS,512}
       imgsurf_max_think_summary_tokens: ${oc.env:IMGSURF_MAX_THINK_SUMMARY_TOKENS,512}
+      imgsurf_reward_strict_tool: ${oc.env:IMGSURF_REWARD_STRICT_TOOL,1.0}
+      imgsurf_reward_loose_tool: ${oc.env:IMGSURF_REWARD_LOOSE_TOOL,0.9}
 
 algorithm:
   adv_estimator: grpo
@@ -99,12 +102,13 @@ custom_reward_function:
   name: compute_score
   reward_kwargs:
     semantic_reward: ${oc.env:IMGSURF_SEMANTIC_REWARD,rule}
-    consistency_reward: ${oc.env:IMGSURF_CONSISTENCY_REWARD,1}
     accuracy_weight: ${oc.env:IMGSURF_ACCURACY_WEIGHT,1.0}
-    format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,0.10}
-    tool_weight: ${oc.env:IMGSURF_TOOL_WEIGHT,0.10}
-    consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,0.10}
-    iteration_weight: ${oc.env:IMGSURF_ITERATION_WEIGHT,0.05}
+    format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,1.0}
+    consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,1.0}
+    exploration_weight: ${oc.env:IMGSURF_EXPLORATION_WEIGHT,1.0}
+    iteration_weight: ${oc.env:IMGSURF_ITERATION_WEIGHT,1.0}
+    reward_strict_tool: ${oc.env:IMGSURF_REWARD_STRICT_TOOL,1.0}
+    reward_loose_tool: ${oc.env:IMGSURF_REWARD_LOOSE_TOOL,0.9}
 
 reward_model:
   # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),
@@ -125,3 +129,4 @@ trainer:
   save_freq: 100
   resume_mode: auto
   total_epochs: 1
+  total_training_steps: null

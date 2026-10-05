@@ -96,56 +96,55 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 ## 格式、工具与一致性奖励
 
-每次策略 response 单独计算格式分数，合法为 `1`，非法为 `0`，最后对所有 response 取平均。初始
-response 必须是 `<think>...</think>` 加一个工具调用或最终回答；每个 refinement response 必须是
+每次策略 response 单独计算格式分数，严格合法为 `1`、宽松合法为配置的 `0.9`、非法为 `0`，最后对所有 response 取平均。初始
+response 必须是 `<think>...</think>`，后接一个合法的 `<tool_call>...</tool_call>`、一个
+`<answer>...</answer>`，或按此顺序同时包含两者；每个 refinement response 必须是
 `<think>...</think><tool_call>...</tool_call>`；最终 response 必须是
 `<think>...</think><answer>...</answer>`。标签外文本、缺失标签、空思考/答案和超过该轮 token 上限都会使
-该 response 的格式分数为 `0`。
+该 response 的基础格式分数为 `0`。工具调用沿用 v4 的四种区域解析情况：严格闭合的
+`<tool_call>...</tool_call>` 得到 `--reward-strict-tool`（默认 `1.0`），另外三种可被
+`screen_tool_call_regions` 解析的非严格闭合形式得到 `--reward-loose-tool`（默认 `0.9`），
+无法解析则为 `0`。解析奖励只检查能否得到区域边界框和标签，不评价 bbox 的重叠质量。
 
-每个 `image_zoom_in_tool` 调用单独计算工具分数，合法为 `1`，非法为 `0`，对所有调用取平均。合法调用
-必须同时满足以下条件：
+没有工具的合法初始回答或最终回答格式分数为 `1`；需要 refinement 但没有可解析工具调用的 response
+为 `0`。对所有策略 response 的分数取平均。
 
-- `<tool_call>` 内是合法 JSON；
-- 函数名是 `image_zoom_in_tool`；
-- `bbox_2d` 是四个有限数，满足 `x1 < x2`、`y1 < y2` 且位于当前坐标范围；
-- `label` 是非空字符串。
+`reward_exploration` 表示是否解析到了合法的初始 `image_zoom_in_tool` 区域：解析到为 `1`，否则为
+`0`。它不依赖最终答案正确性，权重由 `--exploration-weight` 控制。
 
-没有必须调用工具的直接回答不额外扣工具分；需要 refinement 但没有合法 `<tool_call>` 的 response
-会贡献一个 `0`。没有任何 `image_zoom_in_tool` 调用时工具平均值定义为 `0`，只是不产生工具加分。
-工具奖励不评价 bbox 与目标的重叠质量，bbox 内容由最终任务准确率和一致性信号间接约束。
-
-默认开启一致性奖励：只要合法的迭代轨迹在次数上限内达到 `IoU > iou_thr`，就增加奖励。关闭方式：
-
-```bash
-bash ./recipe/imgsurf/run_imgsurf_grpo.sh --consistency-reward off
-```
-
-一致性分数在合法 refinement 最终达到 `IoU > iou_thr` 时为 `1`，否则为 `0`。定位循环结束时，
-根据展平后的 `k_list` 轮次编号 `iter_idx` 计算正向轮次奖励。令
-`len_k_list = max_iter * max_level`，则 `iter_idx=0,1,...,len_k_list-1`：
+一致性分数在合法 refinement 最终达到 `IoU > iou_thr` 时为 `1`，否则为 `0`，并且只有最终答案正确
+（`accuracy == 1`）时才计入总奖励。定位循环结束时，根据展平后的 `k_list` 轮次编号 `iter_idx`
+计算正向轮次奖励。令 `len_k_list = max_iter * max_level`，则 `iter_idx=0,1,...,len_k_list-1`：
 
 ```text
-reward_iter = (len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
+reward_iteration = max(0, len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
 ```
 
-因此越早达到一致性、或越早结束循环，奖励越高；达到最后一轮时为 `0`。没有解析到初始
-`image_zoom_in_tool` 区域、没有进入定位循环时，`reward_iter=0`。
-当 `len_k_list=1` 时分母按 `1` 处理，因此唯一轮次的奖励为 `0`。
+只有 `accuracy == 1` 且 `reward_exploration == 1` 时才计算 `reward_iteration`；否则直接为 `0`。
+因此合法初始区域的奖励由 `reward_exploration` 单独提供，越早达到一致性或结束循环，iteration 奖励越高。
+当 `len_k_list=1` 时，iteration 奖励为 `0`。
 
 当前总奖励为：
 
 ```text
 R = accuracy_weight * accuracy
   + format_weight * mean(response_format_scores)
-  + tool_weight * mean(tool_validity_scores)
-  + consistency_weight * consistency
-  + iteration_weight * reward_iter
+  + consistency_weight * accuracy * consistency
+  + exploration_weight * reward_exploration
+  + iteration_weight * accuracy * reward_iteration
 ```
 
-默认权重为 `accuracy=1.0`、`format=0.10`、`tool=0.10`、`consistency=0.10`、
-`iteration=0.05`。准确率仍是主信号；格式、工具和轮次分数都属于 `[0,1]`，不再使用负向轮次
-惩罚。权重可通过 `--accuracy-weight`、`--format-weight`、`--tool-weight`、
-`--consistency-weight` 和 `--iteration-weight` 调整。
+默认权重为 `accuracy=1.0`、`format=1.0`、`consistency=1.0`、`exploration=1.0`、`iteration=1.0`。
+`reward_exploration` 和 `reward_iteration` 都属于 `[0,1]`。权重可通过
+`--accuracy-weight`、`--format-weight`、`--consistency-weight`、`--exploration-weight` 和
+`--iteration-weight` 调整。
+
+五项默认权重相同，分别鼓励答案正确、格式合法、定位收敛、使用有效初始工具以及尽早完成定位循环。
+建议先使用默认组，观察 accuracy、format、exploration、consistency 和 reward_iteration 的独立日志后再调整。
+
+初始 response 含有工具调用时，即使同时包含一个临时 answer，也仍会进入 v4 的 zoom loop，最后由最终
+response 重新回答；初始只有 answer 时才跳过定位。训练提示词、坐标系和循环参数与 `eval_*_v4.py`
+保持一致：`max_iter=4`、`max_level=1`、`k=0.4`、`iou_thr=0.5`。
 
 ## v4 超参数
 
@@ -168,6 +167,10 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 - Qwen2.5-VL：`zoom_in` 使用当前实际展示图的像素范围，x 属于 `[0,w]`，y 属于 `[0,h]`；
 - 两种模型最终都映射回原图坐标做扩展、IoU 和最终裁剪；
 - 模型族由 checkpoint 的 `config.json:model_type` 检测，脚本会拒绝不一致的手工设置。
+
+Qwen3-VL 的初始请求和每次 refinement 用户消息都会再次明确写出“使用 `[0,1000]` 归一化
+坐标”；Qwen2.5-VL 保持 v4 的像素坐标提示。这样不会依赖模型是否把外部
+`image_zoom_in_tool` 当作原生工具。
 
 ## token 与上下文预算
 
@@ -231,9 +234,17 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 ## 资源与 smoke test
 
 常用资源参数包括 `--total-gpus`（默认 8）、`--nnodes`（默认 1）、`--gpus-per-node`、
-`--rollout-tp-size`（默认 1）、`--train-batch-size`（默认每卡 4 prompt）、
-`--ppo-mini-batch-size`、`--rollout-n`、`--agent-workers`、`--full-dataset` 和
+`--rollout-tp-size`（默认 1）、`--train-batch-size`（默认每卡 8 prompt）、
+`--ppo-mini-batch-size`（默认全局 prompt batch 的一半）、`--rollout-n`、`--agent-workers`、`--full-dataset` 和
 `--max-input-pixels`。多节点还可指定 `--ray-address`；本机卡号可用 `--cuda-visible-devices` 限制。
+
+八卡默认全局 prompt batch 为 `64`（每卡 `8`）。`train_qwen3_8b.sh`、`train_qwen3_4b.sh` 和
+`train_qwen25_7b.sh` 默认传入 `--total-iterations 320`；指定 `--total-iterations 320` 时，
+launcher 通过 `trainer.total_training_steps=320` 在 320 个 global step 后停止；它优先于
+`--total-epochs`。未指定时仍按 `--total-epochs` 运行。当 `rollout-n=8` 时，每个 global step
+会生成全局 batch 的 8 个 rollout 样本，实际生成量还会乘以 rollout-n。
+三个八卡模型包装脚本将 `agent-workers` 设为 `8`，与 sCoT 的每卡并行 rollout 配置相符；
+两卡 `train_2.sh` 仍保留较小的 worker 配置用于 smoke test。
 
 首次建议：
 

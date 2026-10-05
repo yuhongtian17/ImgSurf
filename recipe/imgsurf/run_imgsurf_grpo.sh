@@ -33,21 +33,21 @@ Resources and distributed runtime:
   --nccl-debug LEVEL                NCCL log level (default: WARN)
 
 Training and rollout:
-  --train-batch-size INT            Global prompt batch (default: 4 per GPU)
-  --ppo-mini-batch-size INT         Global PPO mini-batch (default: train batch)
+  --train-batch-size INT            Global prompt batch (default: 8 per GPU)
+  --ppo-mini-batch-size INT         Global PPO mini-batch (default: half train batch)
   --rollout-n INT                   GRPO samples per prompt (default: 8)
   --rollout-gpu-memory-utilization FLOAT
                                       SGLang memory fraction (default: 0.50)
   --learning-rate FLOAT             Actor learning rate (default: 1.0e-6)
   --save-freq INT                   Checkpoint interval (default: 100)
   --total-epochs INT                Training epochs (default: 1)
+  --total-iterations INT            Training steps; takes precedence over total-epochs
   --resume-mode MODE                verl resume mode (default: auto)
 
 ImgSurf trajectory:
   --reward-token all|outer          Reward outer + inner tokens (default: all)
   --semantic-reward rule|judge
                                       Deterministic rules (default) or VLM judge
-  --consistency-reward on|off       Reward IoU convergence (default: on)
   --k FLOAT                         v4 expansion base (default: 0.4)
   --iou-thr FLOAT                   v4 convergence threshold (default: 0.5)
   --max-iter INT                    v4 maximum iterations (default: 4)
@@ -70,10 +70,13 @@ Token and image budgets:
 
 Reward weights:
   --accuracy-weight FLOAT           Answer correctness (default: 1.0)
-  --format-weight FLOAT             Mean response-format validity (default: 0.10)
-  --tool-weight FLOAT               Mean image_zoom_in validity (default: 0.10)
-  --consistency-weight FLOAT        Final localization convergence (default: 0.10)
-  --iteration-weight FLOAT          Early localization-loop reward (default: 0.05)
+  --format-weight FLOAT             Mean response-format/tool validity (default: 1.0)
+  --consistency-weight FLOAT        Correct-answer localization convergence (default: 1.0)
+  --exploration-weight FLOAT        Valid initial zoom-in reward (default: 1.0)
+  --iteration-weight FLOAT          Correct-answer early-loop reward (default: 1.0)
+  --reward-strict-tool FLOAT         Strict tool envelope reward (default: 1.0)
+  --reward-loose-tool FLOAT          Loose v4 tool parse reward (default: 0.9)
+                                    Underscore spellings are accepted too.
 
 VLM judge:
   --judge-base-url URL              Required when semantic-reward=judge
@@ -119,11 +122,11 @@ ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.50}
 LEARNING_RATE=${LEARNING_RATE:-1.0e-6}
 SAVE_FREQ=${SAVE_FREQ:-100}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+TOTAL_ITERATIONS=${TOTAL_ITERATIONS:-}
 RESUME_MODE=${RESUME_MODE:-auto}
 
 IMGSURF_REWARD_TOKEN=${IMGSURF_REWARD_TOKEN:-all}
 IMGSURF_SEMANTIC_REWARD=${IMGSURF_SEMANTIC_REWARD:-rule}
-IMGSURF_CONSISTENCY_REWARD=${IMGSURF_CONSISTENCY_REWARD:-on}
 IMGSURF_K=${IMGSURF_K:-0.4}
 IMGSURF_IOU_THR=${IMGSURF_IOU_THR:-0.5}
 IMGSURF_MAX_ITER=${IMGSURF_MAX_ITER:-4}
@@ -144,10 +147,12 @@ IMGSURF_MIN_TOOL_PIXELS=${IMGSURF_MIN_TOOL_PIXELS:-4096}
 IMGSURF_MAX_TOOL_PIXELS=${IMGSURF_MAX_TOOL_PIXELS:-4194304}
 
 IMGSURF_ACCURACY_WEIGHT=${IMGSURF_ACCURACY_WEIGHT:-1.0}
-IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-0.10}
-IMGSURF_TOOL_WEIGHT=${IMGSURF_TOOL_WEIGHT:-0.10}
-IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-0.10}
-IMGSURF_ITERATION_WEIGHT=${IMGSURF_ITERATION_WEIGHT:-0.05}
+IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-1.0}
+IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-1.0}
+IMGSURF_EXPLORATION_WEIGHT=${IMGSURF_EXPLORATION_WEIGHT:-1.0}
+IMGSURF_ITERATION_WEIGHT=${IMGSURF_ITERATION_WEIGHT:-1.0}
+IMGSURF_REWARD_STRICT_TOOL=${IMGSURF_REWARD_STRICT_TOOL:-1.0}
+IMGSURF_REWARD_LOOSE_TOOL=${IMGSURF_REWARD_LOOSE_TOOL:-0.9}
 
 IMGSURF_JUDGE_BASE_URL=${IMGSURF_JUDGE_BASE_URL:-}
 IMGSURF_JUDGE_MODEL=${IMGSURF_JUDGE_MODEL:-}
@@ -179,10 +184,10 @@ declare -A FLAG_TO_VARIABLE=(
   [--learning-rate]=LEARNING_RATE
   [--save-freq]=SAVE_FREQ
   [--total-epochs]=TOTAL_EPOCHS
+  [--total-iterations]=TOTAL_ITERATIONS
   [--resume-mode]=RESUME_MODE
   [--reward-token]=IMGSURF_REWARD_TOKEN
   [--semantic-reward]=IMGSURF_SEMANTIC_REWARD
-  [--consistency-reward]=IMGSURF_CONSISTENCY_REWARD
   [--k]=IMGSURF_K
   [--iou-thr]=IMGSURF_IOU_THR
   [--max-iter]=IMGSURF_MAX_ITER
@@ -202,9 +207,13 @@ declare -A FLAG_TO_VARIABLE=(
   [--max-tool-pixels]=IMGSURF_MAX_TOOL_PIXELS
   [--accuracy-weight]=IMGSURF_ACCURACY_WEIGHT
   [--format-weight]=IMGSURF_FORMAT_WEIGHT
-  [--tool-weight]=IMGSURF_TOOL_WEIGHT
   [--consistency-weight]=IMGSURF_CONSISTENCY_WEIGHT
+  [--exploration-weight]=IMGSURF_EXPLORATION_WEIGHT
   [--iteration-weight]=IMGSURF_ITERATION_WEIGHT
+  [--reward-strict-tool]=IMGSURF_REWARD_STRICT_TOOL
+  [--reward_strict_tool]=IMGSURF_REWARD_STRICT_TOOL
+  [--reward-loose-tool]=IMGSURF_REWARD_LOOSE_TOOL
+  [--reward_loose_tool]=IMGSURF_REWARD_LOOSE_TOOL
   [--judge-base-url]=IMGSURF_JUDGE_BASE_URL
   [--judge-model]=IMGSURF_JUDGE_MODEL
   [--judge-api-key]=IMGSURF_JUDGE_API_KEY
@@ -270,11 +279,6 @@ case "${FULL_DATASET,,}" in
 esac
 case "${IMGSURF_REWARD_TOKEN}" in all|outer) ;; *) echo "--reward-token must be all or outer" >&2; exit 2 ;; esac
 case "${IMGSURF_SEMANTIC_REWARD}" in rule|judge) ;; *) echo "--semantic-reward must be rule or judge" >&2; exit 2 ;; esac
-case "${IMGSURF_CONSISTENCY_REWARD,,}" in
-  on|true|1) IMGSURF_CONSISTENCY_REWARD=1 ;;
-  off|false|0) IMGSURF_CONSISTENCY_REWARD=0 ;;
-  *) echo "--consistency-reward must be on or off" >&2; exit 2 ;;
-esac
 case "${IMGSURF_EXPAND_MODE}" in quarter|ctr|bbox) ;; *) echo "--expand-mode must be quarter, ctr or bbox" >&2; exit 2 ;; esac
 
 for setting in IMGSURF_MAX_PROMPT_LENGTH IMGSURF_MAX_RESPONSE_LENGTH; do
@@ -300,6 +304,10 @@ if ! is_nonnegative_integer "${IMGSURF_JUDGE_MAX_RETRIES}"; then
   echo "--judge-max-retries must be a non-negative integer" >&2
   exit 2
 fi
+if [[ -n "${TOTAL_ITERATIONS}" ]] && ! is_positive_integer "${TOTAL_ITERATIONS}"; then
+  echo "--total-iterations must be a positive integer" >&2
+  exit 2
+fi
 if ((IMGSURF_MIN_TOOL_PIXELS > IMGSURF_MAX_TOOL_PIXELS)); then
   echo "--min-tool-pixels must be <= --max-tool-pixels" >&2
   exit 2
@@ -318,8 +326,9 @@ check_float "${IMGSURF_IOU_THR}" '0 <= x <= 1' '--iou-thr must be in [0,1]'
 check_float "${ROLLOUT_GPU_MEMORY_UTILIZATION}" '0 < x <= 1' '--rollout-gpu-memory-utilization must be in (0,1]'
 check_float "${LEARNING_RATE}" 'x > 0' '--learning-rate must be positive'
 check_float "${IMGSURF_JUDGE_TIMEOUT}" 'x > 0' '--judge-timeout must be positive'
-for setting in IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT IMGSURF_TOOL_WEIGHT \
-  IMGSURF_CONSISTENCY_WEIGHT IMGSURF_ITERATION_WEIGHT; do
+for setting in IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT \
+  IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT \
+  IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL; do
   check_float "${!setting}" 'x >= 0' "${setting} must be non-negative"
 done
 if [[ "${IMGSURF_SEMANTIC_REWARD}" == judge && -z "${IMGSURF_JUDGE_BASE_URL}" ]]; then
@@ -352,8 +361,8 @@ if ! is_positive_integer "${ROLLOUT_TP_SIZE}" || ((GPUS_PER_NODE % ROLLOUT_TP_SI
   exit 2
 fi
 
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((TOTAL_GPUS * 4))}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-$((TOTAL_GPUS * 8))}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$((TRAIN_BATCH_SIZE / 2))}
 AGENT_WORKERS=${AGENT_WORKERS:-${TOTAL_GPUS}}
 IMGSURF_MAX_ASSISTANT_TURNS=${IMGSURF_MAX_ASSISTANT_TURNS:-$((2 * IMGSURF_MAX_ITER * IMGSURF_MAX_LEVEL + 2))}
 IMGSURF_MAX_USER_TURNS=${IMGSURF_MAX_USER_TURNS:-$((2 * IMGSURF_MAX_ITER * IMGSURF_MAX_LEVEL + 1))}
@@ -418,14 +427,15 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG
 if [[ -n "${RAY_ADDRESS}" ]]; then export RAY_ADDRESS; fi
 
-export IMGSURF_REWARD_TOKEN IMGSURF_SEMANTIC_REWARD IMGSURF_CONSISTENCY_REWARD
+export IMGSURF_REWARD_TOKEN IMGSURF_SEMANTIC_REWARD
 export IMGSURF_K IMGSURF_IOU_THR IMGSURF_MAX_ITER IMGSURF_MAX_LEVEL IMGSURF_EXPAND_MODE
 export IMGSURF_MAX_PROMPT_LENGTH IMGSURF_MAX_RESPONSE_LENGTH IMGSURF_MAX_MODEL_LEN
 export IMGSURF_MAX_BATCHED_TOKENS IMGSURF_MAX_TURN_TOKENS IMGSURF_MIN_FINAL_TOKENS
 export IMGSURF_MAX_THINK_SUMMARY_TOKENS IMGSURF_MAX_ASSISTANT_TURNS IMGSURF_MAX_USER_TURNS
 export IMGSURF_MAX_INPUT_PIXELS IMGSURF_MIN_TOOL_PIXELS IMGSURF_MAX_TOOL_PIXELS
-export IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT IMGSURF_TOOL_WEIGHT
-export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_ITERATION_WEIGHT
+export IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT
+export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT
+export IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL
 export IMGSURF_JUDGE_BASE_URL IMGSURF_JUDGE_MODEL IMGSURF_JUDGE_API_KEY
 export IMGSURF_JUDGE_TIMEOUT IMGSURF_JUDGE_MAX_RETRIES IMGSURF_JUDGE_MAX_PIXELS
 
@@ -440,10 +450,15 @@ if ((NNODES > 1)) && [[ -z "${RAY_ADDRESS}" ]]; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}/ckpts" "${OUTPUT_ROOT}/logs" "${OUTPUT_ROOT}/tensorboard"
-echo "ImgSurf: model=${MODEL_FAMILY}, reward_token=${IMGSURF_REWARD_TOKEN}, semantic_reward=${IMGSURF_SEMANTIC_REWARD}, consistency=${IMGSURF_CONSISTENCY_REWARD}"
+echo "ImgSurf: model=${MODEL_FAMILY}, reward_token=${IMGSURF_REWARD_TOKEN}, semantic_reward=${IMGSURF_SEMANTIC_REWARD}"
 echo "ImgSurf v4: k=${IMGSURF_K}, iou_thr=${IMGSURF_IOU_THR}, max_iter=${IMGSURF_MAX_ITER}, max_level=${IMGSURF_MAX_LEVEL}, expand=${IMGSURF_EXPAND_MODE}"
 echo "ImgSurf context: prompt=${IMGSURF_MAX_PROMPT_LENGTH}, response=${IMGSURF_MAX_RESPONSE_LENGTH}, model=${IMGSURF_MAX_MODEL_LEN}, batched=${IMGSURF_MAX_BATCHED_TOKENS}"
 echo "ImgSurf resources: total_gpus=${TOTAL_GPUS}, nnodes=${NNODES}, gpus_per_node=${GPUS_PER_NODE}, rollout_tp=${ROLLOUT_TP_SIZE}"
+
+TRAINING_STEP_OVERRIDE=()
+if [[ -n "${TOTAL_ITERATIONS}" ]]; then
+  TRAINING_STEP_OVERRIDE=("trainer.total_training_steps=${TOTAL_ITERATIONS}")
+fi
 
 python -m verl.trainer.main_ppo \
   --config-path="${CONFIG_DIR}" \
@@ -472,6 +487,7 @@ python -m verl.trainer.main_ppo \
   "+trainer.tensorboard_dir=${OUTPUT_ROOT}/tensorboard/${EXPERIMENT_NAME}" \
   trainer.save_freq=${SAVE_FREQ} \
   trainer.total_epochs=${TOTAL_EPOCHS} \
+  "${TRAINING_STEP_OVERRIDE[@]}" \
   trainer.resume_mode=${RESUME_MODE} \
   "${HYDRA_OVERRIDES[@]}" \
   2>&1 | tee "${OUTPUT_ROOT}/logs/${EXPERIMENT_NAME}.log"

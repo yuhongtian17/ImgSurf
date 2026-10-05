@@ -6,8 +6,9 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
   --rollout-tp-size=4 \
   --rollout-gpu-memory-utilization=0.50 \
   --rollout-n=8 \
-  --agent-workers=1 \
+  --agent-workers=8 \
   --max-input-pixels=4194304 \
   --full-dataset=on \
+  --total-iterations=320 \
   --total-epochs=1 \
   "$@"

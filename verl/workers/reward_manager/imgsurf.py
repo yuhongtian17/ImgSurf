@@ -16,7 +16,7 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 @register("imgsurf")
 class ImgSurfRewardManager(AbstractRewardManager):
-    """CPU reward manager for ImgSurf's per-response/per-call trajectory scores."""
+    """CPU reward manager for ImgSurf's per-response trajectory scores."""
 
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
         self.tokenizer = tokenizer

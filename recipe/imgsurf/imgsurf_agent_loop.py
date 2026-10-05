@@ -7,6 +7,8 @@ policy inside the returned trajectory.  ``response_mask`` selects whether the
 inner localization tokens also receive policy gradients.
 """
 
+from __future__ import annotations
+
 import copy
 import json
 import logging
@@ -22,7 +24,8 @@ from recipe.imgsurf.prompt_utils import (
     build_final_user_text,
     build_refine_user_text,
     render_imgsurf_chat_prompt,
-    response_format_is_valid,
+    response_format_score,
+    screen_tool_call_regions,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, AgentLoopWorker, register
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
@@ -58,6 +61,8 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         cls.max_turn_tokens = int(multi_turn.get("imgsurf_max_turn_tokens", 1024))
         cls.min_final_tokens = int(multi_turn.get("imgsurf_min_final_tokens", 512))
         cls.max_think_summary_tokens = int(multi_turn.get("imgsurf_max_think_summary_tokens", 512))
+        cls.reward_strict_tool = float(multi_turn.get("imgsurf_reward_strict_tool", 1.0))
+        cls.reward_loose_tool = float(multi_turn.get("imgsurf_reward_loose_tool", 0.9))
         cls.final_turn_reserve = cls.min_final_tokens + cls.max_think_summary_tokens + 160
         if cls.final_turn_reserve >= cls.response_length:
             raise ValueError(
@@ -235,76 +240,50 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         response_kind: str,
     ) -> tuple[list[dict[str, Any]], str]:
         text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        metadata.setdefault("response_format_scores", []).append(
-            int(
-                response_format_is_valid(
-                    text,
-                    response_kind,
-                    token_count=len(response_ids),
-                    max_tokens=self.max_turn_tokens,
-                )
-            )
-        )
-        metadata.setdefault("response_kinds", []).append(response_kind)
-
-        # Count only policy image_zoom_in_tool calls.  The synthetic
-        # image_zoom_out_tool call is an environment observation and must not
-        # dilute the tool-validity average.
-        raw_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, flags=re.DOTALL | re.IGNORECASE)
-        unclosed = max(0, text.lower().count("<tool_call>") - len(raw_blocks))
-        textual_attempts = unclosed
-        for block in raw_blocks:
-            try:
-                payload = json.loads(block)
-                if isinstance(payload, dict) and payload.get("name") == "image_zoom_out_tool":
-                    continue
-            except Exception:
-                pass
-            textual_attempts += 1
-        _, calls = await self.tool_parser.extract_tool_calls(response_ids)
-        parsed_policy_calls = sum(1 for call in calls if call.name != "image_zoom_out_tool")
-        attempts = max(textual_attempts, parsed_policy_calls)
-        valid_raw_calls = 0
-        for block in raw_blocks:
-            try:
-                payload = json.loads(block)
-                if not isinstance(payload, dict) or payload.get("name") != "image_zoom_in_tool":
-                    continue
-                arguments = payload.get("arguments")
-                if isinstance(arguments, dict) and tool.validate_parameters(instance_id, arguments)[0]:
-                    valid_raw_calls += 1
-            except Exception:
-                continue
+        regions = screen_tool_call_regions(text)
+        has_tool_marker = "<tool_call>" in text.lower() or "addcriterion" in text.lower()
         valid_arguments: list[dict[str, Any]] = []
-        for call in calls:
-            try:
-                arguments = json.loads(call.arguments)
-                if not isinstance(arguments, dict):
-                    continue
-                valid, _ = tool.validate_parameters(instance_id, arguments)
-                if call.name == "image_zoom_in_tool" and valid:
-                    valid_arguments.append(arguments)
-            except Exception as exc:
-                logger.debug("Ignoring invalid ImgSurf tool call: %s", exc)
-                continue
-
-        # A refinement prompt requires a call.  Treat an omitted call as one
-        # invalid attempt; an optional initial/final answer may use no tool.
-        if required and attempts == 0:
-            attempts = 1
-        # A parser-only call without a literal <tool_call> envelope is not a
-        # legal response-format/tool attempt, even if the backend parser
-        # happens to recover arguments from the token stream.
-        valid_count = min(attempts, max(valid_raw_calls, len(valid_arguments))) if textual_attempts else 0
-        invalid = max(0, attempts - valid_count)
+        strict_count = 0
+        state = getattr(tool, "_instances", {}).get(instance_id, {})
+        model_family = state.get("model_family", "qwen3_vl")
+        display = state.get("active_display_size") or state.get("initial_display_size") or (1000, 1000)
+        max_x, max_y = (1000.0, 1000.0) if model_family == "qwen3_vl" else (float(display[0]), float(display[1]))
+        for arguments, strict in regions:
+            strict_count += int(strict)
+            # v4 scores parseability, not bbox overlap/quality. Clamp only the
+            # copy passed to the executor so parseable responses enter the loop.
+            box = [max(0.0, min(max_x, float(value))) for value in arguments["bbox_2d"]]
+            if box[2] <= box[0]:
+                box[0], box[2] = 0.0, max_x
+            if box[3] <= box[1]:
+                box[1], box[3] = 0.0, max_y
+            executable = {
+                "bbox_2d": box,
+                "label": arguments["label"] or "relevant evidence",
+            }
+            if tool.validate_parameters(instance_id, executable)[0]:
+                valid_arguments.append(executable)
+        tool_quality = "strict" if regions and strict_count == len(regions) else "loose" if regions else "none"
+        if has_tool_marker and not regions:
+            tool_quality = "invalid"
+        attempts = max(len(regions), 1 if required and not regions else 0)
+        valid_count = len(valid_arguments)
         metadata["tool_attempts"] += attempts
         metadata["parsed_tool_calls"] += valid_count
         metadata["successful_tool_calls"] += valid_count
-        metadata["invalid_tool_calls"] += invalid
-        metadata.setdefault("tool_validity_scores", []).extend(
-            [1] * valid_count + [0] * max(0, attempts - valid_count)
+        metadata["invalid_tool_calls"] += max(0, attempts - valid_count)
+        format_value = response_format_score(
+            text,
+            response_kind,
+            token_count=len(response_ids),
+            max_tokens=self.max_turn_tokens,
+            tool_quality=tool_quality,
+            reward_strict_tool=self.reward_strict_tool,
+            reward_loose_tool=self.reward_loose_tool,
         )
-        return valid_arguments, text
+        metadata.setdefault("response_format_scores", []).append(float(format_value))
+        metadata.setdefault("response_kinds", []).append(response_kind)
+        return valid_arguments[:1], text
 
     def _think_summary(self, think_blocks: list[str]) -> str:
         summary = "\n---\n".join(block for block in think_blocks[-2:] if block.strip())
@@ -345,7 +324,6 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             "invalid_tool_calls": 0,
             "response_format_scores": [],
             "response_kinds": [],
-            "tool_validity_scores": [],
             "initial_zoom_in_parsed": False,
             "iteration_idx": None,
             "len_k_list": int(tool.max_iter) * int(getattr(tool, "max_level", 1)),
@@ -382,14 +360,16 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 # attempt and contributes a zero to the tool average.
                 metadata["tool_attempts"] += 1
                 metadata["invalid_tool_calls"] += 1
-                metadata.setdefault("tool_validity_scores", []).append(0)
             first_think = _extract_think(initial_text)
             if first_think:
                 think_blocks.append(first_think)
 
             observation = None
             observation_meta: dict[str, Any] = {}
-            if initial_calls and not already_answered:
+            # v4 still runs the zoom loop when the first response contains
+            # both a tool call and an answer; the answer is replaced by the
+            # final step after localization.
+            if initial_calls:
                 metadata["initial_zoom_in_parsed"] = True
                 with simple_timer("tool_calls", metrics):
                     observation, _, observation_meta = await tool.execute(instance_id, initial_calls[0])
@@ -454,6 +434,11 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 if not appended:
                     with simple_timer("tool_calls", metrics):
                         observation, _, observation_meta = await tool.finalize_current(instance_id)
+                    # A parsed initial region has already entered the first
+                    # flattened k-list slot even when the context budget
+                    # prevents generating its refinement response.
+                    if metadata.get("iteration_idx") is None:
+                        metadata["iteration_idx"] = 0
                     break
                 user_turns += 2
                 inner_ids = await self._generate(
@@ -484,11 +469,15 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                 if completed_iterations > 0:
                     # ``iterations`` counts the flattened k-list position.
                     metadata["iteration_idx"] = completed_iterations - 1
-                metadata["converged"] = bool(observation_meta.get("converged", False))
+                metadata["converged"] = bool(
+                    observation_meta.get("converged", False)
+                    and observation_meta.get("parsed_valid", True)
+                )
 
+            has_localization = bool(metadata.get("initial_zoom_in_parsed"))
             final_images = (
                 _images_from_response(observation)
-                if not already_answered and observation is not None and observation_meta.get("done")
+                if has_localization and observation is not None and observation_meta.get("done")
                 else []
             )
             if final_images:
@@ -499,12 +488,18 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                         "content": [
                             {"type": "text", "text": f"<tool_response>\n{tool_text}"},
                             {"type": "image"},
-                            {"type": "text", "text": build_final_user_text(self._think_summary(think_blocks))},
+                            {
+                                "type": "text",
+                                "text": build_final_user_text(
+                                    self._think_summary(think_blocks),
+                                    str(observation_meta.get("question", "")),
+                                ),
+                            },
                             {"type": "text", "text": "</tool_response>"},
                         ],
                     }
                 ]
-            elif not already_answered:
+            elif has_localization or not already_answered:
                 final_segment = [{"role": "user", "content": USER_PROMPT_STEP10_NO_CROPS}]
             else:
                 final_segment = []

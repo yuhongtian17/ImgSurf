@@ -34,11 +34,11 @@ parser.add_argument('--save_path', type=str, default=None, help='Path to save th
 parser.add_argument('--eval_model_name', type=str, default=None, help='Model name for evaluation')
 parser.add_argument('--num_workers', type=int, default=8)
 parser.add_argument('--qwen_ver', type=int, default=3, help="qwen version")
-parser.add_argument('--prompt_ver', type=int, default=1, help="1: updated; 0: deepeyes")
-parser.add_argument('--k', type=float, default=0.5, help='Zoom loop parameter k')
+parser.add_argument('--prompt_ver', type=int, default=3, help="1: deepeyes; 2: qwen2.5-vl; 3: qwen3-vl")
+parser.add_argument('--k', type=float, default=0.4, help='Zoom loop parameter k')
 parser.add_argument('--iou_thr', type=float, default=0.5, help='IoU threshold for zoom loop convergence')
-parser.add_argument('--max_iter', type=int, default=10, help='Max zoom loop iterations')
-parser.add_argument('--max_level', type=int, default=2, help='Max zoom level per iteration')
+parser.add_argument('--max_iter', type=int, default=4, help='Max zoom loop iterations')
+parser.add_argument('--max_level', type=int, default=1, help='Max zoom level per iteration')
 parser.add_argument('--expand_mode', type=str, default='quarter', help="I{level} construction: 'bbox', 'ctr', or 'quarter' (default)")
 args = parser.parse_args()
 
@@ -89,7 +89,7 @@ Return a json object with function name and arguments within <tool_call></tool_c
 {"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  
 </tool_call>"""
 
-instruction_prompt_system_updated = """You are a helpful assistant.
+instruction_prompt_system_qwen25vl = """You are a helpful assistant.
 
 # Tools
 You may call one or more functions to assist with the user query.
@@ -132,7 +132,55 @@ Return a json object with function name and arguments within <tool_call></tool_c
 {"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}
 </tool_call>"""
 
-instruction_prompt_system = instruction_prompt_system_updated if bool(args.prompt_ver) else instruction_prompt_system_deepeyes
+instruction_prompt_system_qwen3vl = """You are a helpful assistant.
+
+# Tools
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{
+    "type": "function",
+    "function": {
+        "name": "image_zoom_in_tool",
+        "description": "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) and an object label.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox_2d": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. The coordinates are normalized to [0,1000] relative to the image currently shown."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "The name or label of the object in the specified bounding box."
+                }
+            },
+            "required": ["bbox_2d", "label"]
+        }
+    }
+}
+</tools>
+
+# How to call a tool
+Return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+**Example**:
+<tool_call>
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}
+</tool_call>"""
+
+if int(args.prompt_ver) == 1:
+    instruction_prompt_system = instruction_prompt_system_deepeyes
+elif int(args.prompt_ver) == 2:
+    instruction_prompt_system = instruction_prompt_system_qwen25vl
+else:
+    instruction_prompt_system = instruction_prompt_system_qwen3vl
 
 USER_PROMPT_STEP1 = "\nThink first, call **image_zoom_in_tool** if needed, then answer. Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>...</answer> "
 

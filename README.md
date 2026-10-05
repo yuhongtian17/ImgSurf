@@ -2,7 +2,7 @@
 
 ## Installation Step by Step for Evaluation
 
-Yes indeed, it depends on [PyTorch](https://pytorch.org/), [DeepEyes](https://github.com/Visual-Agent/DeepEyes), [SCAgent](https://github.com/YWenxi/think-with-images-through-self-calling):
+Yes indeed, it depends on [PyTorch](https://pytorch.org/), [DeepEyes](https://github.com/Visual-Agent/DeepEyes), [sCoT](https://github.com/YWenxi/think-with-images-through-self-calling):
 
 ```shell
 # ref: https://developer.nvidia.com/cuda-toolkit-archive
@@ -191,7 +191,7 @@ bash train_qwen25_7b.sh
 
 python -m verl.model_merger merge \
     --backend fsdp \
-    --local_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b/ckpts/grpo-8gpu-1node/global_step_1470/actor/" \
+    --local_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b/ckpts/grpo-8gpu-1node/global_step_320/actor/" \
     --target_dir "/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen25_7b/merged/"
 ```
 

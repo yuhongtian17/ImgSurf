@@ -2,8 +2,11 @@
 # Licensed under the Apache License, Version 2.0
 """Dataset adapter and rewards for Qwen2.5-VL/Qwen3-VL ImgSurf GRPO."""
 
+from __future__ import annotations
+
 import base64
 import io
+import json
 import logging
 import math
 import os
@@ -21,7 +24,8 @@ from recipe.imgsurf.prompt_utils import (
     build_initial_user_text,
     build_system_prompt,
     render_imgsurf_chat_prompt,
-    response_format_is_valid,
+    response_format_score,
+    screen_tool_call_regions,
 )
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
@@ -88,7 +92,9 @@ class CustomRLHFDataset(RLHFDataset):
         source = str(row_dict.get("data_source", "")).lower()
         ability = str(row_dict.get("ability", "")).lower()
         clean_question = str(extra_info.get("question") or "").strip()
-        if "thinklite" in source or ability == "math":
+        # The parquet filename/source identifies the ThinkLite math subset;
+        # visual questions may also carry an ``ability=math`` label.
+        if "thinklite" in source:
             question = clean_question or prompt_question
         else:
             question = prompt_question or clean_question
@@ -117,7 +123,7 @@ class CustomRLHFDataset(RLHFDataset):
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": build_initial_user_text(question)},
+                    {"type": "text", "text": build_initial_user_text(question, model_family)},
                 ],
             },
         ]
@@ -166,7 +172,7 @@ class CustomRLHFDataset(RLHFDataset):
         if self.return_full_prompt:
             row_dict["full_prompts"] = raw_prompt
 
-        is_math = "thinklite" in source or ability == "math"
+        is_math = "thinklite" in source
         if os.environ.get("IMGSURF_SEMANTIC_REWARD", "rule").lower() == "judge" and not is_math:
             judge_pixels = int(os.environ.get("IMGSURF_JUDGE_MAX_PIXELS", "1048576"))
             extra_info["judge_image_data_url"] = _image_data_url(original_images[0], judge_pixels)
@@ -207,12 +213,16 @@ class CustomRLHFDataset(RLHFDataset):
 
 def _extract_answer(solution: str) -> tuple[str, bool]:
     matches = re.findall(r"<answer>\s*(.*?)\s*</answer>", solution, flags=re.DOTALL | re.IGNORECASE)
-    balanced = solution.lower().count("<answer>") == solution.lower().count("</answer>") == 1
-    answer = matches[0].strip() if len(matches) == 1 else ""
+    opening_count = solution.lower().count("<answer>")
+    closing_count = solution.lower().count("</answer>")
+    # A valid initial response may contain a provisional answer together with
+    # a tool call.  The final response is the answer that must be judged.
+    balanced = opening_count == closing_count == len(matches) and len(matches) > 0
+    answer = matches[-1].strip() if matches else ""
     if not answer:
         tail = re.sub(r"<tool_call>.*?</tool_call>|<tool_response>.*?</tool_response>", "", solution, flags=re.DOTALL)
         answer = tail.split("</think>")[-1].strip()
-    return answer, bool(balanced and len(matches) == 1 and answer)
+    return answer, bool(balanced and answer)
 
 
 def _normalize(text: str) -> str:
@@ -458,50 +468,34 @@ def _judge_semantic(question: str, ground_truth: str, prediction: str, image_dat
 
 
 def _syntactic_tool_metadata(solution: str) -> dict[str, Any]:
-    all_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", solution, flags=re.DOTALL | re.IGNORECASE)
-    unclosed = max(0, solution.lower().count("<tool_call>") - len(all_blocks))
-    attempts = unclosed
-    valid = 0
-    invalid = unclosed
-    for block in all_blocks:
-        try:
-            import json
+    """Infer rollout metadata with the same parser used by the v4 loop.
 
-            call = json.loads(block)
-            # image_zoom_out_tool calls are scripted environment observations,
-            # not policy localization attempts.
-            if call.get("name") == "image_zoom_out_tool":
-                continue
-            attempts += 1
-            arguments = call.get("arguments")
-            box = arguments.get("bbox_2d") if isinstance(arguments, dict) else None
-            label = arguments.get("label") if isinstance(arguments, dict) else None
-            numeric = isinstance(box, list) and len(box) == 4 and all(math.isfinite(float(x)) for x in box)
-            ordered = numeric and float(box[0]) < float(box[2]) and float(box[1]) < float(box[3])
-            if call.get("name") == "image_zoom_in_tool" and ordered and isinstance(label, str) and label.strip():
-                valid += 1
-            else:
-                invalid += 1
-        except (TypeError, ValueError, KeyError):
-            attempts += 1
-            invalid += 1
-        except Exception:
-            attempts += 1
-            invalid += 1
+    This path is used only when an older caller does not provide trusted
+    rollout metadata.  Tool validity is deliberately parseability of a
+    zoom-in region; bbox quality is handled by the executor, not by the
+    format reward.
+    """
+    text = solution if isinstance(solution, str) else ""
+    regions = screen_tool_call_regions(text)
+    markers = len(re.findall(r"<tool_call>|addCriterion", text, flags=re.IGNORECASE))
+    attempts = max(markers, len(regions))
+    valid = len(regions)
+    invalid = max(0, attempts - valid)
     return {
         "tool_attempts": attempts,
         "parsed_tool_calls": valid,
         "successful_tool_calls": valid,
         "invalid_tool_calls": invalid,
-        "tool_validity_scores": [1] * valid + [0] * invalid,
-        "converged": bool(re.search(r"\bconverged\s*=\s*true\b", solution, flags=re.IGNORECASE)),
+        "converged": bool(re.search(r"\bconverged\s*=\s*true\b", text, flags=re.IGNORECASE)),
         "initial_zoom_in_parsed": bool(valid),
         "iteration_idx": None,
         "len_k_list": 0,
     }
 
 
-def _syntactic_format_scores(solution: str) -> list[int]:
+def _syntactic_format_scores(
+    solution: str, reward_strict_tool: float = 1.0, reward_loose_tool: float = 0.9
+) -> list[float]:
     """Fallback format score for callers that do not have rollout metadata."""
 
     if not isinstance(solution, str) or not solution.strip():
@@ -509,18 +503,29 @@ def _syntactic_format_scores(solution: str) -> list[int]:
     think_blocks = list(re.finditer(r"<think>.*?</think>", solution, flags=re.DOTALL | re.IGNORECASE))
     if not think_blocks:
         return [0]
-    scores: list[int] = []
+    scores: list[float] = []
     for index, match in enumerate(think_blocks):
         end = think_blocks[index + 1].start() if index + 1 < len(think_blocks) else len(solution)
         response = solution[match.start() : end].strip()
-        kind = "final" if re.search(r"<answer>", response, flags=re.IGNORECASE) else (
-            "initial" if index == 0 else "refinement"
+        has_tool = re.search(r"<tool_call>", response, flags=re.IGNORECASE) is not None
+        has_answer = re.search(r"<answer>", response, flags=re.IGNORECASE) is not None
+        kind = "initial" if index == 0 else ("final" if has_answer else "refinement")
+        regions = screen_tool_call_regions(response)
+        has_marker = has_tool or "addcriterion" in response.lower()
+        quality = "strict" if regions and all(strict for _, strict in regions) else "loose" if regions else "invalid" if has_marker else "none"
+        scores.append(
+            response_format_score(
+                response,
+                kind,
+                tool_quality=quality,
+                reward_strict_tool=reward_strict_tool,
+                reward_loose_tool=reward_loose_tool,
+            )
         )
-        scores.append(int(response_format_is_valid(response, kind)))
     return scores
 
 
-def _mean_binary(values: Any, default: float = 0.0) -> float:
+def _mean_scores(values: Any, default: float = 0.0) -> float:
     if values is None:
         return float(default)
     if isinstance(values, (str, bytes)):
@@ -534,14 +539,10 @@ def _mean_binary(values: Any, default: float = 0.0) -> float:
     normalized = []
     for value in values:
         try:
-            normalized.append(float(float(value) > 0.5))
+            normalized.append(float(value))
         except (TypeError, ValueError):
             normalized.append(0.0)
     return float(sum(normalized) / len(normalized))
-
-
-def _as_bool(value: Any) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def compute_score(
@@ -550,29 +551,30 @@ def compute_score(
     ground_truth: str,
     extra_info: dict[str, Any] | None = None,
     semantic_reward: str = "rule",
-    consistency_reward: Any = "1",
     accuracy_weight: float = 1.0,
-    format_weight: float = 0.10,
-    tool_weight: float = 0.10,
-    consistency_weight: float = 0.10,
-    iteration_weight: float = 0.05,
+    format_weight: float = 1.0,
+    consistency_weight: float = 1.0,
+    iteration_weight: float = 1.0,
+    exploration_weight: float = 1.0,
+    reward_strict_tool: float = 1.0,
+    reward_loose_tool: float = 0.9,
 ) -> dict[str, float]:
-    """Compute the ImgSurf reward from per-response and per-call averages.
+    """Compute the ImgSurf reward from per-response averages.
 
-    ``response_format_scores``, ``tool_validity_scores``, ``iteration_idx`` and
-    ``len_k_list`` are emitted by the agent loop. A syntactic fallback keeps
-    offline evaluation useful when a caller supplies only a response string.
+    Tool-call validity is folded into ``response_format_scores`` by the agent
+    loop. ``iteration_idx`` and ``len_k_list`` are emitted by the rollout; a
+    syntactic fallback keeps offline evaluation useful when metadata is absent.
     """
 
     extra_info = extra_info or {}
     accuracy_weight = float(accuracy_weight)
     format_weight = float(format_weight)
-    tool_weight = float(tool_weight)
     consistency_weight = float(consistency_weight)
     iteration_weight = float(iteration_weight)
+    exploration_weight = float(exploration_weight)
     answer, _ = _extract_answer(solution_str)
     source = str(data_source).lower()
-    is_math = "thinklite" in source or str(extra_info.get("ability", "")).lower() == "math"
+    is_math = "thinklite" in source
     if is_math:
         accuracy = float(_math_match(answer, str(ground_truth)))
         visual_source = False
@@ -600,53 +602,48 @@ def compute_score(
     metadata = extra_info.get("imgsurf_reward_metadata") or _syntactic_tool_metadata(solution_str)
     format_scores = metadata.get("response_format_scores")
     if format_scores is None:
-        format_scores = _syntactic_format_scores(solution_str)
-    format_average = _mean_binary(format_scores)
+        format_scores = _syntactic_format_scores(
+            solution_str, float(reward_strict_tool), float(reward_loose_tool)
+        )
+    format_average = _mean_scores(format_scores)
     attempts = int(metadata.get("tool_attempts", 0))
     parsed = int(metadata.get("parsed_tool_calls", 0))
-    successful = int(metadata.get("successful_tool_calls", 0))
     invalid = int(metadata.get("invalid_tool_calls", max(0, attempts - parsed)))
-    tool_scores = metadata.get("tool_validity_scores")
-    if tool_scores is None:
-        tool_scores = [1] * successful + [0] * max(0, attempts - successful)
-    # There is no tool obligation when the model answers directly.  Keep this
-    # component neutral for non-visual/math examples and zero for a visual
-    # response with no image_zoom_in_tool call.
-    tool_average = _mean_binary(tool_scores, default=0.0)
-    tool_parse = float(visual_source and tool_average)
-    consistency = float(_as_bool(consistency_reward) and visual_source and bool(metadata.get("converged", False)))
-    iteration_idx = metadata.get("iteration_idx")
-    len_k_list = int(metadata.get("len_k_list", 0) or 0)
-    reward_iter = 0.0
-    if metadata.get("initial_zoom_in_parsed", False) and iteration_idx is not None:
-        try:
-            iteration_idx = int(iteration_idx)
-        except (TypeError, ValueError):
-            iteration_idx = None
-        if iteration_idx is not None and len_k_list > 0 and 0 <= iteration_idx < len_k_list:
-            reward_iter = (len_k_list - 1 - iteration_idx) / max(1, len_k_list - 1)
+    accuracy_correct = accuracy == 1.0
+    reward_exploration = float(bool(metadata.get("initial_zoom_in_parsed", False)))
+    consistency = 0.0
+    reward_iteration = 0.0
+    iteration_idx = None
+    len_k_list = 0
+    if accuracy_correct:
+        consistency = float(visual_source and bool(metadata.get("converged", False)))
+        iteration_idx = metadata.get("iteration_idx")
+        len_k_list = int(metadata.get("len_k_list", 0) or 0)
+        if reward_exploration == 1.0 and iteration_idx is not None:
+            try:
+                iteration_idx = int(iteration_idx)
+            except (TypeError, ValueError):
+                iteration_idx = None
+            if iteration_idx is not None and len_k_list > 0 and 0 <= iteration_idx < len_k_list:
+                reward_iteration = max(0.0, len_k_list - 1 - iteration_idx) / max(1, len_k_list - 1)
 
     score = (
         accuracy_weight * accuracy
         + format_weight * format_average
-        + tool_weight * tool_parse
         + consistency_weight * consistency
-        + iteration_weight * reward_iter
+        + exploration_weight * reward_exploration
+        + iteration_weight * reward_iteration
     )
     return {
         "score": float(score),
         "accuracy": accuracy,
         "format": format_average,
         "format_average": format_average,
-        "tool": tool_average,
-        "valid_tool": tool_average,
-        "tool_average": tool_average,
-        "tool_parse": tool_parse,
         "invalid_tool_calls": float(invalid),
         "consistency": consistency,
+        "reward_exploration": reward_exploration,
         "tool_calls": float(attempts),
-        "reward_iter": float(reward_iter),
-        "iteration_reward": float(reward_iter),
+        "reward_iteration": float(reward_iteration),
         "iteration_idx": float(iteration_idx) if iteration_idx is not None else -1.0,
         "len_k_list": float(len_k_list),
     }
@@ -659,10 +656,12 @@ if __name__ == "__main__":
     assert _rule_semantic_match("1.0", "1") is True
     assert _rule_semantic_match("4", "-4") is False
     assert _math_match("4", "-4") is False
+    assert _extract_answer(
+        "<think>locate</think><tool_call>{}</tool_call><answer>A</answer>"
+        "<think>final</think><answer>B</answer>"
+    )[0] == "B"
     valid = '<think>x</think><tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call>'
     invalid = '<think>x</think><tool_call>{not-json}</tool_call>'
-    assert compute_score("chart", valid, "B")["valid_tool"] == 1.0
-    assert compute_score("chart", invalid, "B")["valid_tool"] == 0.0
     averaged = compute_score(
         "chart",
         "<think>x</think><answer>B</answer>",
@@ -670,7 +669,6 @@ if __name__ == "__main__":
         extra_info={
             "imgsurf_reward_metadata": {
                 "response_format_scores": [1, 0],
-                "tool_validity_scores": [1, 0],
                 "initial_zoom_in_parsed": True,
                 "iteration_idx": 0,
                 "len_k_list": 4,
@@ -678,8 +676,24 @@ if __name__ == "__main__":
             }
         },
     )
-    assert averaged["format"] == 0.5 and averaged["tool"] == 0.5
-    assert averaged["reward_iter"] == 1.0
+    assert averaged["format"] == 0.5
+    assert averaged["reward_exploration"] == 1.0
+    assert averaged["reward_iteration"] == 1.0
+    wrong = compute_score(
+        "chart",
+        "<think>x</think><answer>A</answer>",
+        "B",
+        extra_info={
+            "imgsurf_reward_metadata": {
+                "response_format_scores": [1],
+                "initial_zoom_in_parsed": True,
+                "iteration_idx": 0,
+                "len_k_list": 8,
+                "converged": True,
+            }
+        },
+    )
+    assert wrong["consistency"] == 0.0 and wrong["reward_iteration"] == 0.0
     late = compute_score(
         "chart",
         "<think>x</think><answer>B</answer>",
@@ -687,14 +701,13 @@ if __name__ == "__main__":
         extra_info={
             "imgsurf_reward_metadata": {
                 "response_format_scores": [1],
-                "tool_validity_scores": [],
                 "initial_zoom_in_parsed": True,
                 "iteration_idx": 7,
                 "len_k_list": 8,
             }
         },
     )
-    assert late["reward_iter"] == 0.0
+    assert late["reward_exploration"] == 1.0 and late["reward_iteration"] == 0.0
     middle = compute_score(
         "chart",
         "<think>x</think><answer>B</answer>",
@@ -707,7 +720,7 @@ if __name__ == "__main__":
             }
         },
     )
-    assert middle["reward_iter"] == 4 / 7
+    assert middle["reward_iteration"] == 4 / 7
     no_loop = compute_score("chart", "<think>x</think><answer>B</answer>", "B")
-    assert no_loop["reward_iter"] == 0.0
+    assert no_loop["reward_exploration"] == 0.0 and no_loop["reward_iteration"] == 0.0
     print("ImgSurf reward smoke tests passed")
