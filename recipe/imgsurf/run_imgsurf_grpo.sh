@@ -371,7 +371,7 @@ if ((TRAIN_BATCH_SIZE % TOTAL_GPUS != 0 || PPO_MINI_BATCH_SIZE % TOTAL_GPUS != 0
 fi
 
 if [[ ! -f "${REPO_ROOT}/verl/trainer/main_ppo.py" ]]; then
-  echo "Could not locate SCAgent repository from ${SCRIPT_DIR}" >&2
+  echo "Could not locate sCoT repository from ${SCRIPT_DIR}" >&2
   exit 2
 fi
 if [[ ! -r "${CONFIG_DIR}/${CONFIG_NAME}.yaml" ]]; then

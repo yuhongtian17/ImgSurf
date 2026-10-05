@@ -13,7 +13,7 @@
 # limitations under the License.
 """Qwen3-VL M-RoPE utilities backported from verl main.
 
-SCAgent's verl 0.5 branch only contains the Qwen2/2.5-VL implementation.
+sCoT's verl 0.5 branch only contains the Qwen2/2.5-VL implementation.
 The dense Qwen3-VL actor can otherwise use the native Transformers forward
 path when remove-padding, Ulysses SP and fused PPO kernels are disabled.
 """

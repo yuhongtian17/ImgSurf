@@ -1,12 +1,12 @@
 # ImgSurf v4-style GRPO（Qwen2.5-VL / Qwen3-VL）
 
-本目录是 `SCAgent-main` 的差分覆盖层。请只在 `ImgSurf-dev` 中维护这些文件，训练前复制到同结构的
-SCAgent 仓库：
+本目录是 `sCoT-main` 的差分覆盖层。请只在 `ImgSurf-dev` 中维护这些文件，训练前复制到同结构的
+sCoT 仓库：
 
 ```bash
 cd /home/dataset-assist-0/workspace
-cp -r ./ImgSurf-dev/* ./SCAgent-main/
-cd ./SCAgent-main
+cp -r ./ImgSurf-dev/* ./sCoT-main/
+cd ./sCoT-main
 ```
 
 当前实现把 `eval/deepeyes/eval_hrbench_v4.py` 的主要轨迹变成可重放的 GRPO 多轮序列，训练时使用与
@@ -258,5 +258,5 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 对应关系遵循 `TOTAL_GPUS` → `--total-gpus`、`IMGSURF_MAX_INPUT_PIXELS` →
 `--max-input-pixels` 这类规则，具体映射以 `--help` 为准。
 
-训练保存的是 verl/FSDP actor checkpoint。使用 v4 评测前，仍需按 SCAgent/verl 的 checkpoint merge
+训练保存的是 verl/FSDP actor checkpoint。使用 v4 评测前，仍需按 sCoT/verl 的 checkpoint merge
 流程导出为 Hugging Face 权重。

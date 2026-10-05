@@ -70,7 +70,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
     def _install_worker_bridges(cls) -> None:
         """Bridge ImgSurf-only rollout metadata and Qwen3-VL M-RoPE.
 
-        The upstream SCAgent worker currently exports neither custom trajectory
+        The upstream sCoT worker currently exports neither custom trajectory
         metadata nor Qwen3-VL multimodal inputs.  Installing the small wrappers
         here keeps ImgSurf as a copy-overlay without replacing the large
         upstream worker module.
