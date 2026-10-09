@@ -25,6 +25,7 @@ from recipe.imgsurf.prompt_utils import (
     build_system_prompt,
     render_imgsurf_chat_prompt,
     response_format_score,
+    response_format_quality,
     screen_tool_call_regions,
 )
 from verl.utils.dataset.rl_dataset import RLHFDataset
@@ -208,7 +209,7 @@ class CustomRLHFDataset(RLHFDataset):
         else:
             text = str(content)
         text = text.replace("<image>", "").strip()
-        return re.split(r"\nThink first", text, maxsplit=1)[0].strip()
+        return re.split(r"\n(?:Think first|Call \*\*image_zoom_in_tool\*\*)", text, maxsplit=1)[0].strip()
 
 
 def _extract_answer(solution: str) -> tuple[str, bool]:
@@ -470,10 +471,9 @@ def _judge_semantic(question: str, ground_truth: str, prediction: str, image_dat
 def _syntactic_tool_metadata(solution: str) -> dict[str, Any]:
     """Infer rollout metadata with the same parser used by the v4 loop.
 
-    This path is used only when an older caller does not provide trusted
-    rollout metadata.  Tool validity is deliberately parseability of a
-    zoom-in region; bbox quality is handled by the executor, not by the
-    format reward.
+    This path is used only when trusted rollout metadata is unavailable. Tool
+    validity follows the parser's basic bbox checks; semantic bbox quality is
+    handled by the executor, not by the format reward.
     """
     text = solution if isinstance(solution, str) else ""
     regions = screen_tool_call_regions(text)
@@ -494,34 +494,35 @@ def _syntactic_tool_metadata(solution: str) -> dict[str, Any]:
 
 
 def _syntactic_format_scores(
-    solution: str, reward_strict_tool: float = 1.0, reward_loose_tool: float = 0.9
+    solution: str, reward_strict: float = 1.0, reward_loose: float = 0.9
 ) -> list[float]:
     """Fallback format score for callers that do not have rollout metadata."""
 
     if not isinstance(solution, str) or not solution.strip():
         return [0]
-    think_blocks = list(re.finditer(r"<think>.*?</think>", solution, flags=re.DOTALL | re.IGNORECASE))
-    if not think_blocks:
+    # Offline callers may only have flattened text and no turn metadata; score
+    # that text as one conservative initial/final response.
+    if not re.search(r"<answer>|<tool_call>|addCriterion", solution, flags=re.IGNORECASE):
         return [0]
     scores: list[float] = []
-    for index, match in enumerate(think_blocks):
-        end = think_blocks[index + 1].start() if index + 1 < len(think_blocks) else len(solution)
-        response = solution[match.start() : end].strip()
-        has_tool = re.search(r"<tool_call>", response, flags=re.IGNORECASE) is not None
-        has_answer = re.search(r"<answer>", response, flags=re.IGNORECASE) is not None
-        kind = "initial" if index == 0 else ("final" if has_answer else "refinement")
-        regions = screen_tool_call_regions(response)
-        has_marker = has_tool or "addcriterion" in response.lower()
-        quality = "strict" if regions and all(strict for _, strict in regions) else "loose" if regions else "invalid" if has_marker else "none"
-        scores.append(
-            response_format_score(
-                response,
-                kind,
-                tool_quality=quality,
-                reward_strict_tool=reward_strict_tool,
-                reward_loose_tool=reward_loose_tool,
-            )
+    response = solution.strip()
+    # The fallback has no reliable turn boundaries, so this is the only
+    # conservative interpretation.
+    has_answer = re.search(r"<answer>", response, flags=re.IGNORECASE) is not None
+    has_tool = re.search(r"<tool_call>|addCriterion", response) is not None
+    kind = "initial" if not has_answer or has_tool else "final"
+    regions = screen_tool_call_regions(response)
+    has_marker = has_tool
+    quality = "strict" if regions and all(strict for _, strict in regions) else "loose" if regions else "invalid" if has_marker else "none"
+    scores.append(
+        response_format_score(
+            response,
+            kind,
+            tool_quality=quality,
+            reward_strict=reward_strict,
+            reward_loose=reward_loose,
         )
+    )
     return scores
 
 
@@ -556,14 +557,15 @@ def compute_score(
     consistency_weight: float = 1.0,
     iteration_weight: float = 1.0,
     exploration_weight: float = 1.0,
-    reward_strict_tool: float = 1.0,
-    reward_loose_tool: float = 0.9,
+    reward_strict: float = 1.0,
+    reward_loose: float = 0.9,
 ) -> dict[str, float]:
     """Compute the ImgSurf reward from per-response averages.
 
     Tool-call validity is folded into ``response_format_scores`` by the agent
-    loop. ``iteration_idx`` and ``len_k_list`` are emitted by the rollout; a
-    syntactic fallback keeps offline evaluation useful when metadata is absent.
+    loop. ``reward_exploration`` and ``reward_consistency`` are gated by answer
+    accuracy, and ``iteration_idx``/``len_k_list`` are emitted by the rollout;
+    a syntactic fallback keeps offline evaluation useful when metadata is absent.
     """
 
     extra_info = extra_info or {}
@@ -603,29 +605,38 @@ def compute_score(
     format_scores = metadata.get("response_format_scores")
     if format_scores is None:
         format_scores = _syntactic_format_scores(
-            solution_str, float(reward_strict_tool), float(reward_loose_tool)
+            solution_str, float(reward_strict), float(reward_loose)
         )
     format_average = _mean_scores(format_scores)
     attempts = int(metadata.get("tool_attempts", 0))
     parsed = int(metadata.get("parsed_tool_calls", 0))
     invalid = int(metadata.get("invalid_tool_calls", max(0, attempts - parsed)))
     accuracy_correct = accuracy == 1.0
-    reward_exploration = float(bool(metadata.get("initial_zoom_in_parsed", False)))
+    # Exploration and consistency are conditional rewards: an incorrect
+    # answer cannot receive credit for how it was localized.
+    reward_exploration = (
+        float(bool(metadata.get("initial_zoom_in_parsed", False))) if accuracy_correct else 0.0
+    )
     consistency = 0.0
     reward_iteration = 0.0
     iteration_idx = None
     len_k_list = 0
     if accuracy_correct:
         consistency = float(visual_source and bool(metadata.get("converged", False)))
-        iteration_idx = metadata.get("iteration_idx")
-        len_k_list = int(metadata.get("len_k_list", 0) or 0)
-        if reward_exploration == 1.0 and iteration_idx is not None:
-            try:
-                iteration_idx = int(iteration_idx)
-            except (TypeError, ValueError):
-                iteration_idx = None
-            if iteration_idx is not None and len_k_list > 0 and 0 <= iteration_idx < len_k_list:
-                reward_iteration = max(0.0, len_k_list - 1 - iteration_idx) / max(1, len_k_list - 1)
+        # Exploration is the prerequisite for entering the v4 zoom loop.  Do
+        # not inspect loop metadata when no valid initial region was found.
+        if reward_exploration == 1.0:
+            iteration_idx = metadata.get("iteration_idx")
+            # The rollout normally supplies this value.  Keep the v4 defaults
+            # for metadata-free callers: max_iter=4 and max_level=1.
+            len_k_list = int(metadata.get("len_k_list") or (4 * 1))
+            if iteration_idx is not None:
+                try:
+                    iteration_idx = int(iteration_idx)
+                except (TypeError, ValueError):
+                    iteration_idx = None
+                if iteration_idx is not None and len_k_list > 0 and 0 <= iteration_idx < len_k_list:
+                    reward_iteration = max(0.0, len_k_list - 1 - iteration_idx) / max(1, len_k_list - 1)
 
     score = (
         accuracy_weight * accuracy
@@ -637,10 +648,12 @@ def compute_score(
     return {
         "score": float(score),
         "accuracy": accuracy,
+        "reward_accuracy": accuracy,
         "format": format_average,
         "format_average": format_average,
         "invalid_tool_calls": float(invalid),
         "consistency": consistency,
+        "reward_consistency": consistency,
         "reward_exploration": reward_exploration,
         "tool_calls": float(attempts),
         "reward_iteration": float(reward_iteration),
@@ -657,14 +670,20 @@ if __name__ == "__main__":
     assert _rule_semantic_match("4", "-4") is False
     assert _math_match("4", "-4") is False
     assert _extract_answer(
-        "<think>locate</think><tool_call>{}</tool_call><answer>A</answer>"
-        "<think>final</think><answer>B</answer>"
+        '<tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call>'
+        "<answer>B</answer>"
     )[0] == "B"
-    valid = '<think>x</think><tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call>'
-    invalid = '<think>x</think><tool_call>{not-json}</tool_call>'
+    strict_tool = '<tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}</tool_call>'
+    loose_tool = '<tool_call>{"name":"image_zoom_in_tool","arguments":{"bbox_2d":[1,2,3,4],"label":"dog"}}'
+    assert response_format_quality(strict_tool, "initial") == "strict"
+    assert response_format_quality(loose_tool, "initial") == "loose"
+    assert response_format_quality("<answer>B</answer>", "final") == "answer"
+    assert response_format_quality("<answer>B", "final") == "invalid"
+    assert response_format_score(strict_tool, "initial") == 0.9  # no think: loose think multiplier
+    assert response_format_score("<think>locate</think><answer>B</answer>", "final") == 1.0
     averaged = compute_score(
         "chart",
-        "<think>x</think><answer>B</answer>",
+        "<answer>B</answer>",
         "B",
         extra_info={
             "imgsurf_reward_metadata": {
@@ -681,7 +700,7 @@ if __name__ == "__main__":
     assert averaged["reward_iteration"] == 1.0
     wrong = compute_score(
         "chart",
-        "<think>x</think><answer>A</answer>",
+        "<answer>A</answer>",
         "B",
         extra_info={
             "imgsurf_reward_metadata": {
@@ -693,7 +712,12 @@ if __name__ == "__main__":
             }
         },
     )
-    assert wrong["consistency"] == 0.0 and wrong["reward_iteration"] == 0.0
+    assert (
+        wrong["reward_accuracy"] == 0.0
+        and wrong["reward_exploration"] == 0.0
+        and wrong["reward_consistency"] == 0.0
+        and wrong["reward_iteration"] == 0.0
+    )
     late = compute_score(
         "chart",
         "<think>x</think><answer>B</answer>",
@@ -721,6 +745,6 @@ if __name__ == "__main__":
         },
     )
     assert middle["reward_iteration"] == 4 / 7
-    no_loop = compute_score("chart", "<think>x</think><answer>B</answer>", "B")
+    no_loop = compute_score("chart", "<answer>B</answer>", "B")
     assert no_loop["reward_exploration"] == 0.0 and no_loop["reward_iteration"] == 0.0
     print("ImgSurf reward smoke tests passed")

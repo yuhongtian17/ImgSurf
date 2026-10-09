@@ -74,9 +74,8 @@ Reward weights:
   --consistency-weight FLOAT        Correct-answer localization convergence (default: 1.0)
   --exploration-weight FLOAT        Valid initial zoom-in reward (default: 1.0)
   --iteration-weight FLOAT          Correct-answer early-loop reward (default: 1.0)
-  --reward-strict-tool FLOAT         Strict tool envelope reward (default: 1.0)
-  --reward-loose-tool FLOAT          Loose v4 tool parse reward (default: 0.9)
-                                    Underscore spellings are accepted too.
+  --reward-strict FLOAT              Strict tool/think reward (default: 1.0; --reward_strict alias)
+  --reward-loose FLOAT               Loose tool/think reward (default: 0.9; --reward_loose alias)
 
 VLM judge:
   --judge-base-url URL              Required when semantic-reward=judge
@@ -89,15 +88,15 @@ VLM judge:
 Other:
   -h, --help                        Show this message
 
-Both '--flag value' and '--flag=value' are accepted. Existing uppercase
-environment variables remain backward compatible, but flags take precedence.
+Both '--flag value' and '--flag=value' are accepted. The corresponding
+uppercase environment variables are secondary inputs, and flags take precedence.
 Arguments without a leading '--' are forwarded as raw Hydra overrides and have
 the highest precedence.
 EOF
 }
 
-# Environment values are backward-compatible secondary inputs. Launcher flags
-# are parsed afterwards, so they always win over the corresponding environment.
+# Environment values are secondary inputs. Launcher flags are parsed afterwards,
+# so they always win over the corresponding environment.
 MODEL_PATH=${MODEL_PATH:-/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct}
 DATA_ROOT=${DATA_ROOT:-/home/dataset-assist-0/workspace/deepeyes271/DeepEyes-Datasets-47k}
 OUTPUT_ROOT=${OUTPUT_ROOT:-/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf}
@@ -151,8 +150,8 @@ IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-1.0}
 IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-1.0}
 IMGSURF_EXPLORATION_WEIGHT=${IMGSURF_EXPLORATION_WEIGHT:-1.0}
 IMGSURF_ITERATION_WEIGHT=${IMGSURF_ITERATION_WEIGHT:-1.0}
-IMGSURF_REWARD_STRICT_TOOL=${IMGSURF_REWARD_STRICT_TOOL:-1.0}
-IMGSURF_REWARD_LOOSE_TOOL=${IMGSURF_REWARD_LOOSE_TOOL:-0.9}
+IMGSURF_REWARD_STRICT=${IMGSURF_REWARD_STRICT:-1.0}
+IMGSURF_REWARD_LOOSE=${IMGSURF_REWARD_LOOSE:-0.9}
 
 IMGSURF_JUDGE_BASE_URL=${IMGSURF_JUDGE_BASE_URL:-}
 IMGSURF_JUDGE_MODEL=${IMGSURF_JUDGE_MODEL:-}
@@ -210,10 +209,10 @@ declare -A FLAG_TO_VARIABLE=(
   [--consistency-weight]=IMGSURF_CONSISTENCY_WEIGHT
   [--exploration-weight]=IMGSURF_EXPLORATION_WEIGHT
   [--iteration-weight]=IMGSURF_ITERATION_WEIGHT
-  [--reward-strict-tool]=IMGSURF_REWARD_STRICT_TOOL
-  [--reward_strict_tool]=IMGSURF_REWARD_STRICT_TOOL
-  [--reward-loose-tool]=IMGSURF_REWARD_LOOSE_TOOL
-  [--reward_loose_tool]=IMGSURF_REWARD_LOOSE_TOOL
+  [--reward-strict]=IMGSURF_REWARD_STRICT
+  [--reward_strict]=IMGSURF_REWARD_STRICT
+  [--reward-loose]=IMGSURF_REWARD_LOOSE
+  [--reward_loose]=IMGSURF_REWARD_LOOSE
   [--judge-base-url]=IMGSURF_JUDGE_BASE_URL
   [--judge-model]=IMGSURF_JUDGE_MODEL
   [--judge-api-key]=IMGSURF_JUDGE_API_KEY
@@ -328,7 +327,7 @@ check_float "${LEARNING_RATE}" 'x > 0' '--learning-rate must be positive'
 check_float "${IMGSURF_JUDGE_TIMEOUT}" 'x > 0' '--judge-timeout must be positive'
 for setting in IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT \
   IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT \
-  IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL; do
+  IMGSURF_REWARD_STRICT IMGSURF_REWARD_LOOSE; do
   check_float "${!setting}" 'x >= 0' "${setting} must be non-negative"
 done
 if [[ "${IMGSURF_SEMANTIC_REWARD}" == judge && -z "${IMGSURF_JUDGE_BASE_URL}" ]]; then
@@ -435,7 +434,7 @@ export IMGSURF_MAX_THINK_SUMMARY_TOKENS IMGSURF_MAX_ASSISTANT_TURNS IMGSURF_MAX_
 export IMGSURF_MAX_INPUT_PIXELS IMGSURF_MIN_TOOL_PIXELS IMGSURF_MAX_TOOL_PIXELS
 export IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT
 export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT
-export IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL
+export IMGSURF_REWARD_STRICT IMGSURF_REWARD_LOOSE
 export IMGSURF_JUDGE_BASE_URL IMGSURF_JUDGE_MODEL IMGSURF_JUDGE_API_KEY
 export IMGSURF_JUDGE_TIMEOUT IMGSURF_JUDGE_MAX_RETRIES IMGSURF_JUDGE_MAX_PIXELS
 
@@ -451,6 +450,7 @@ fi
 
 mkdir -p "${OUTPUT_ROOT}/ckpts" "${OUTPUT_ROOT}/logs" "${OUTPUT_ROOT}/tensorboard"
 echo "ImgSurf: model=${MODEL_FAMILY}, reward_token=${IMGSURF_REWARD_TOKEN}, semantic_reward=${IMGSURF_SEMANTIC_REWARD}"
+echo "ImgSurf format rewards: strict=${IMGSURF_REWARD_STRICT}, loose=${IMGSURF_REWARD_LOOSE}"
 echo "ImgSurf v4: k=${IMGSURF_K}, iou_thr=${IMGSURF_IOU_THR}, max_iter=${IMGSURF_MAX_ITER}, max_level=${IMGSURF_MAX_LEVEL}, expand=${IMGSURF_EXPAND_MODE}"
 echo "ImgSurf context: prompt=${IMGSURF_MAX_PROMPT_LENGTH}, response=${IMGSURF_MAX_RESPONSE_LENGTH}, model=${IMGSURF_MAX_MODEL_LEN}, batched=${IMGSURF_MAX_BATCHED_TOKENS}"
 echo "ImgSurf resources: total_gpus=${TOTAL_GPUS}, nnodes=${NNODES}, gpus_per_node=${GPUS_PER_NODE}, rollout_tp=${ROLLOUT_TP_SIZE}"

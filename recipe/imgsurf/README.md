@@ -50,7 +50,7 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 所有启动配置现在都有命令行参数。`--name=value` 与 `--name value` 两种形式均可；用
 `bash ./recipe/imgsurf/run_imgsurf_grpo.sh --help` 查看按路径、资源、训练、轨迹、预算、奖励和 judge
-分类后的完整参数表。原有大写环境变量仍兼容，但仅作为次级配置来源。
+分类后的完整参数表。对应的大写环境变量可作为次级配置来源。
 
 ## 两种 token 训练模式
 
@@ -96,32 +96,39 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 ## 格式、工具与一致性奖励
 
-每次策略 response 单独计算格式分数，严格合法为 `1`、宽松合法为配置的 `0.9`、非法为 `0`，最后对所有 response 取平均。初始
-response 必须是 `<think>...</think>`，后接一个合法的 `<tool_call>...</tool_call>`、一个
-`<answer>...</answer>`，或按此顺序同时包含两者；每个 refinement response 必须是
-`<think>...</think><tool_call>...</tool_call>`；最终 response 必须是
-`<think>...</think><answer>...</answer>`。标签外文本、缺失标签、空思考/答案和超过该轮 token 上限都会使
-该 response 的基础格式分数为 `0`。工具调用沿用 v4 的四种区域解析情况：严格闭合的
-`<tool_call>...</tool_call>` 得到 `--reward-strict-tool`（默认 `1.0`），另外三种可被
-`screen_tool_call_regions` 解析的非严格闭合形式得到 `--reward-loose-tool`（默认 `0.9`），
-无法解析则为 `0`。解析奖励只检查能否得到区域边界框和标签，不评价 bbox 的重叠质量。
+每次策略 response 单独计算格式分数，最后对所有 response 取平均。基本轨迹规则为：第一次 response
+至少包含一个可识别的 `tool_call` 或 `answer`；最后一次 response 必须包含严格闭合的
+`<answer>...</answer>`；中间 response 必须包含可被 `screen_tool_call_regions` 解析的
+`tool_call`。格式奖励不再强制要求 `<think>...</think>`。
 
-没有工具的合法初始回答或最终回答格式分数为 `1`；需要 refinement 但没有可解析工具调用的 response
-为 `0`。对所有策略 response 的分数取平均。
+工具调用沿用 `screen_tool_call_regions` 的四种解析情况：严格闭合的
+`<tool_call>...</tool_call>` 得到 `--reward-strict`（或 `--reward_strict`，默认 `1.0`），另外三种非严格闭合但仍能
+解析出区域的形式得到 `--reward-loose`（或 `--reward_loose`，默认 `0.9`），无法解析则为 `0`。格式奖励会校验
+bbox 是否为四个有限数、非负、坐标顺序正确且不超过当前坐标范围；不会评价 bbox 的大小、重叠或定位质量。`<answer>...</answer>`
+必须严格闭合且内容非空，否则该 response 的基础格式奖励为 `0`。
+Qwen3-VL 的当前坐标范围是 `[0,1000]`，Qwen2.5-VL 使用当前展示图的像素宽高。
 
-`reward_exploration` 表示是否解析到了合法的初始 `image_zoom_in_tool` 区域：解析到为 `1`，否则为
-`0`。它不依赖最终答案正确性，权重由 `--exploration-weight` 控制。
+两个参数对应环境变量 `IMGSURF_REWARD_STRICT` 和 `IMGSURF_REWARD_LOOSE`。
 
-一致性分数在合法 refinement 最终达到 `IoU > iou_thr` 时为 `1`，否则为 `0`，并且只有最终答案正确
-（`accuracy == 1`）时才计入总奖励。定位循环结束时，根据展平后的 `k_list` 轮次编号 `iter_idx`
-计算正向轮次奖励。令 `len_k_list = max_iter * max_level`，则 `iter_idx=0,1,...,len_k_list-1`：
+在基础格式奖励之上，若 response 中的 `<think>...</think>` 标签全部严格配对，则乘以
+`--reward-strict`；否则乘以 `--reward-loose`。因此没有 think 的合法 response 仍然有效，但按
+宽松 think 系数计分。训练提示词仍显式要求模型先思考，并继续使用与 `eval_*_v4.py` 对齐的
+推理、zoom-out、refinement 和最终回答提示词；这里只是不把 think 标签作为格式奖励的硬门槛。
+基础格式和 think 乘数共同决定该 response 的分数。
+
+`reward_exploration` 表示是否解析到了合法的初始 `image_zoom_in_tool` 区域，但只有
+`reward_accuracy == 1` 时才计算；答案错误时 `reward_exploration=0`，也不再继续判断定位信息。
+
+一致性分数同样以 `reward_accuracy == 1` 为前提：在合法 refinement 最终达到 `IoU > iou_thr`
+时为 `1`，否则为 `0`。当 `reward_exploration == 1` 时，轨迹必然进入 zoom loop，令
+`len_k_list = max_iter * max_level`，根据跳出循环时的 `iter_idx=0,1,...,len_k_list-1` 计算：
 
 ```text
 reward_iteration = max(0, len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
 ```
 
-只有 `accuracy == 1` 且 `reward_exploration == 1` 时才计算 `reward_iteration`；否则直接为 `0`。
-因此合法初始区域的奖励由 `reward_exploration` 单独提供，越早达到一致性或结束循环，iteration 奖励越高。
+代码先判断 `reward_exploration`：如果为 `0`，`reward_iteration` 直接为 `0`，不会继续读取
+`iteration_idx`；只有为 `1` 时才使用上式，越早达到一致性或结束循环，iteration 奖励越高。
 当 `len_k_list=1` 时，iteration 奖励为 `0`。
 
 当前总奖励为：
@@ -129,9 +136,9 @@ reward_iteration = max(0, len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
 ```text
 R = accuracy_weight * accuracy
   + format_weight * mean(response_format_scores)
-  + consistency_weight * accuracy * consistency
+  + consistency_weight * consistency
   + exploration_weight * reward_exploration
-  + iteration_weight * accuracy * reward_iteration
+  + iteration_weight * reward_iteration
 ```
 
 默认权重为 `accuracy=1.0`、`format=1.0`、`consistency=1.0`、`exploration=1.0`、`iteration=1.0`。
@@ -210,7 +217,7 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 1. 命令末尾不带 `--` 的原生 Hydra override；
 2. `run_imgsurf_grpo.sh` 的 `--kebab-case` 命令行参数；
-3. 调用前显式设置的兼容环境变量；
+3. 调用前显式设置的环境变量；
 4. `run_imgsurf_grpo.sh` 中的默认值；
 5. `configs/*.yaml` 的兜底默认值；
 6. verl 上游默认配置。

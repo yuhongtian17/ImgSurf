@@ -61,8 +61,8 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         cls.max_turn_tokens = int(multi_turn.get("imgsurf_max_turn_tokens", 1024))
         cls.min_final_tokens = int(multi_turn.get("imgsurf_min_final_tokens", 512))
         cls.max_think_summary_tokens = int(multi_turn.get("imgsurf_max_think_summary_tokens", 512))
-        cls.reward_strict_tool = float(multi_turn.get("imgsurf_reward_strict_tool", 1.0))
-        cls.reward_loose_tool = float(multi_turn.get("imgsurf_reward_loose_tool", 0.9))
+        cls.reward_strict = float(multi_turn.get("imgsurf_reward_strict", 1.0))
+        cls.reward_loose = float(multi_turn.get("imgsurf_reward_loose", 0.9))
         cls.final_turn_reserve = cls.min_final_tokens + cls.max_think_summary_tokens + 160
         if cls.final_turn_reserve >= cls.response_length:
             raise ValueError(
@@ -240,23 +240,19 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         response_kind: str,
     ) -> tuple[list[dict[str, Any]], str]:
         text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        regions = screen_tool_call_regions(text)
-        has_tool_marker = "<tool_call>" in text.lower() or "addcriterion" in text.lower()
-        valid_arguments: list[dict[str, Any]] = []
-        strict_count = 0
         state = getattr(tool, "_instances", {}).get(instance_id, {})
         model_family = state.get("model_family", "qwen3_vl")
         display = state.get("active_display_size") or state.get("initial_display_size") or (1000, 1000)
         max_x, max_y = (1000.0, 1000.0) if model_family == "qwen3_vl" else (float(display[0]), float(display[1]))
+        regions = screen_tool_call_regions(text, max_x=max_x, max_y=max_y)
+        has_tool_marker = "<tool_call>" in text.lower() or "addcriterion" in text.lower()
+        valid_arguments: list[dict[str, Any]] = []
+        strict_count = 0
         for arguments, strict in regions:
             strict_count += int(strict)
-            # v4 scores parseability, not bbox overlap/quality. Clamp only the
-            # copy passed to the executor so parseable responses enter the loop.
-            box = [max(0.0, min(max_x, float(value))) for value in arguments["bbox_2d"]]
-            if box[2] <= box[0]:
-                box[0], box[2] = 0.0, max_x
-            if box[3] <= box[1]:
-                box[1], box[3] = 0.0, max_y
+            # Geometry has already been validated by the parser.  Preserve
+            # the model's coordinates; semantic bbox quality is not rewarded.
+            box = [float(value) for value in arguments["bbox_2d"]]
             executable = {
                 "bbox_2d": box,
                 "label": arguments["label"] or "relevant evidence",
@@ -277,9 +273,11 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             response_kind,
             token_count=len(response_ids),
             max_tokens=self.max_turn_tokens,
+            bbox_max_x=max_x,
+            bbox_max_y=max_y,
             tool_quality=tool_quality,
-            reward_strict_tool=self.reward_strict_tool,
-            reward_loose_tool=self.reward_loose_tool,
+            reward_strict=self.reward_strict,
+            reward_loose=self.reward_loose,
         )
         metadata.setdefault("response_format_scores", []).append(float(format_value))
         metadata.setdefault("response_kinds", []).append(response_kind)

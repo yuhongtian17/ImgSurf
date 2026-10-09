@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import re
-import math
 import json
+import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -15,13 +15,13 @@ from eval.deepeyes.tool_call_utils import screen_tool_call_regions as _eval_scre
 
 USER_PROMPT_STEP1 = (
     "\nThink first, call **image_zoom_in_tool** if needed, then answer. "
-    "Format strictly as:  <think>...</think>  <tool_call>...</tool_call> "
-    "(if tools needed)  <answer>...</answer> "
+    "Format as: <think>...</think> <tool_call>...</tool_call> (if tools needed) "
+    "<answer>...</answer>."
 )
 
 USER_PROMPT_STEP10_NO_CROPS = (
     "\nBased on your previous thinking, give your final answer. "
-    "Format strictly as:  <think>...</think>  <answer>...</answer> "
+    "Format as: <think>...</think> <answer>...</answer>."
 )
 
 
@@ -37,8 +37,15 @@ def coordinate_description(model_family: str, width: int | None = None, height: 
     return "Coordinates are pixel coordinates in the width and height of the image currently shown."
 
 
-def screen_tool_call_regions(text: str) -> list[tuple[dict[str, Any], bool]]:
-    """Use the v4 parser while retaining strict-versus-loose envelope state."""
+def screen_tool_call_regions(
+    text: str, *, max_x: float | None = 1000.0, max_y: float | None = 1000.0
+) -> list[tuple[dict[str, Any], bool]]:
+    """Parse v4 tool regions and validate only coordinate syntax.
+
+    Range/order/finiteness checks decide whether a region can be extracted.
+    Region size, overlap, and semantic localization quality are deliberately
+    not evaluated here.
+    """
     try:
         parsed = _eval_screen_tool_call_regions(text)
     except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
@@ -51,9 +58,18 @@ def screen_tool_call_regions(text: str) -> list[tuple[dict[str, Any], bool]]:
         try:
             values = [float(value) for value in bbox]
         except (TypeError, ValueError, OverflowError):
-            continue
-        if len(values) != 4 or not all(math.isfinite(value) for value in values):
-            continue
+            return []
+        if (
+            len(values) != 4
+            or not all(math.isfinite(value) for value in values)
+            or values[0] < 0
+            or values[1] < 0
+            or values[2] <= values[0]
+            or values[3] <= values[1]
+            or (max_x is not None and values[2] > max_x)
+            or (max_y is not None and values[3] > max_y)
+        ):
+            return []
         safe_parsed.append((values, label))
     strict = (
         bool(safe_parsed)
@@ -243,7 +259,7 @@ def build_refine_user_text(
         f"If you output multiple regions, only the first will be used. "
         f"The bbox_2d coordinates must be relative to the image you see (I{index}). "
         f"{coordinate_description(model_family, width, height)}\n"
-        "Format strictly as:  <think>...</think>  <tool_call>...</tool_call> "
+        "Format strictly as: <think>...</think> <tool_call>...</tool_call>."
     )
 
 
@@ -251,9 +267,36 @@ def build_final_user_text(think_summary: str, question: str = "") -> str:
     summary = think_summary.strip()
     return (
         "Based on the cropped region(s) shown above and the following thinking from previous steps:\n\n"
-        f"{summary}\n\nReview and give your final answer. Choose one option that best fits. Format strictly as:  "
-        "<think>...</think>  <answer>...</answer> "
+        f"{summary}\n\nReview and give your final answer. Choose one option that best fits. "
+        "Format strictly as: <think>...</think> <answer>...</answer>."
     )
+
+
+def _strict_tag_pairs(text: str, tag: str) -> bool:
+    """Return whether every occurrence of one tag is properly paired."""
+
+    opens = list(re.finditer(rf"<{tag}>", text, flags=re.IGNORECASE))
+    closes = list(re.finditer(rf"</{tag}>", text, flags=re.IGNORECASE))
+    if not opens and not closes:
+        return False
+    if len(opens) != len(closes):
+        return False
+    return all(open_match.end() <= close_match.start() for open_match, close_match in zip(opens, closes))
+
+
+def _answer_span(text: str) -> tuple[re.Match[str] | None, bool]:
+    """Return the single answer span and whether answer tags are well formed."""
+
+    opens = list(re.finditer(r"<answer>", text, flags=re.IGNORECASE))
+    closes = list(re.finditer(r"</answer>", text, flags=re.IGNORECASE))
+    if not opens and not closes:
+        return None, False
+    if len(opens) != 1 or len(closes) != 1 or opens[0].end() > closes[0].start():
+        return None, False
+    span = re.compile(r"<answer>(.*?)</answer>", flags=re.DOTALL | re.IGNORECASE).search(text)
+    if span is None or not span.group(1).strip():
+        return None, False
+    return span, True
 
 
 def response_format_quality(
@@ -262,67 +305,53 @@ def response_format_quality(
     *,
     token_count: int | None = None,
     max_tokens: int | None = None,
+    bbox_max_x: float | None = 1000.0,
+    bbox_max_y: float | None = 1000.0,
 ) -> str:
-    """Classify one response; only tool envelopes use v4's loose grammar."""
+    """Classify one response without requiring a ``<think>`` block.
+
+    The basic trajectory rules are checked first.  A parsed tool call receives
+    strict/loose quality according to its envelope; an answer-only response is
+    valid with quality ``answer``.  ``<think>`` is handled separately by
+    :func:`response_format_score` as a multiplier.
+    """
     if not isinstance(text, str) or not text.strip():
         return "invalid"
     if max_tokens is not None and token_count is not None and token_count > max_tokens:
         return "invalid"
     text = text.strip()
-    if text.count("<think>") != 1 or text.count("</think>") != 1:
+    answer, has_answer = _answer_span(text)
+    answer_marked = bool(re.search(r"</?answer>", text, flags=re.IGNORECASE))
+    if answer_marked and not has_answer:
         return "invalid"
-    thought = re.match(r"<think>(.*?)</think>", text, flags=re.DOTALL)
-    if thought is None or not thought.group(1).strip():
-        return "invalid"
-    # Nested/misordered structural tags are not a closed think/answer block.
-    structural = r"</?(?:think|answer|tool_call)>"
-    if re.search(structural, thought.group(1)):
-        return "invalid"
-    actions = text[thought.end():].strip()
-    if actions.count("<answer>") != actions.count("</answer>") or actions.count("<answer>") > 1:
-        return "invalid"
-    answer = re.search(r"<answer>(.*?)</answer>\s*$", actions, flags=re.DOTALL)
-    if "<answer>" in actions and answer is None:
-        return "invalid"
+
+    # Remove a valid answer before asking the shared parser to find tool calls;
+    # examples or text inside an answer must not become tool calls.
+    tool_text = text
     if answer is not None:
-        body = answer.group(1).strip()
-        if not body or re.search(structural, body):
-            return "invalid"
-    tool_text = actions[:answer.start()].strip() if answer else actions
-    has_tool, has_answer = bool(tool_text), answer is not None
+        tool_text = text[: answer.start()] + text[answer.end() :]
+    regions = screen_tool_call_regions(tool_text, max_x=bbox_max_x, max_y=bbox_max_y)
+    has_tool_marker = bool(re.search(r"<tool_call>|addCriterion", tool_text))
+    has_tool = bool(regions)
     if response_kind == "initial":
         if not (has_tool or has_answer):
             return "invalid"
     elif response_kind == "refinement":
-        if not has_tool or has_answer:
+        if not has_tool:
             return "invalid"
     elif response_kind == "final":
-        if has_tool or not has_answer:
+        if not has_answer:
             return "invalid"
     else:
         raise ValueError(f"Unknown response kind: {response_kind}")
     if not has_tool:
+        if has_tool_marker:
+            return "invalid"
         return "answer"
 
-    # Screen exactly as evaluation does. No IoU, label, size, ordering or
-    # coordinate-range test enters the format reward.
-    if not screen_tool_call_regions(tool_text):
+    if has_tool_marker and not regions:
         return "invalid"
-    starts = list(re.finditer(r"<tool_call>|addCriterion", tool_text))
-    if not starts or tool_text[:starts[0].start()].strip():
-        return "invalid"
-    strict = True
-    for i, start in enumerate(starts):
-        end = starts[i + 1].start() if i + 1 < len(starts) else len(tool_text)
-        block = tool_text[start.start():end].strip()
-        if not screen_tool_call_regions(block):
-            return "invalid"
-        if re.search(r"</?(?:think|answer)>", block):
-            return "invalid"
-        closes = block.count("</tool_call>")
-        if closes > 1 or (closes and not block.endswith("</tool_call>")):
-            return "invalid"
-        strict = strict and start.group() == "<tool_call>" and closes == 1
+    strict = all(strict_envelope for _, strict_envelope in regions)
     return "strict" if strict else "loose"
 
 
@@ -332,21 +361,32 @@ def response_format_score(
     *,
     token_count: int | None = None,
     max_tokens: int | None = None,
+    bbox_max_x: float | None = 1000.0,
+    bbox_max_y: float | None = 1000.0,
     tool_quality: str | None = None,
-    reward_strict_tool: float = 1.0,
-    reward_loose_tool: float = 0.9,
+    reward_strict: float = 1.0,
+    reward_loose: float = 0.9,
 ) -> float:
     quality = response_format_quality(
-        text, response_kind, token_count=token_count, max_tokens=max_tokens
+        text,
+        response_kind,
+        token_count=token_count,
+        max_tokens=max_tokens,
+        bbox_max_x=bbox_max_x,
+        bbox_max_y=bbox_max_y,
     )
     if tool_quality == "invalid":
         quality = "invalid"
     elif tool_quality in {"strict", "loose"} and quality in {"strict", "loose"}:
         quality = tool_quality
-    return {
+    base = {
         "invalid": 0.0, "answer": 1.0,
-        "strict": float(reward_strict_tool), "loose": float(reward_loose_tool),
+        "strict": float(reward_strict), "loose": float(reward_loose),
     }[quality]
+    if quality == "invalid":
+        return 0.0
+    think_multiplier = float(reward_strict) if _strict_tag_pairs(text, "think") else float(reward_loose)
+    return base * think_multiplier
 
 
 def render_imgsurf_chat_prompt(

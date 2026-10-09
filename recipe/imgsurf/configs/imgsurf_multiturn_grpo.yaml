@@ -87,8 +87,8 @@ actor_rollout_ref:
       imgsurf_max_turn_tokens: ${oc.env:IMGSURF_MAX_TURN_TOKENS,1024}
       imgsurf_min_final_tokens: ${oc.env:IMGSURF_MIN_FINAL_TOKENS,512}
       imgsurf_max_think_summary_tokens: ${oc.env:IMGSURF_MAX_THINK_SUMMARY_TOKENS,512}
-      imgsurf_reward_strict_tool: ${oc.env:IMGSURF_REWARD_STRICT_TOOL,1.0}
-      imgsurf_reward_loose_tool: ${oc.env:IMGSURF_REWARD_LOOSE_TOOL,0.9}
+      imgsurf_reward_strict: ${oc.env:IMGSURF_REWARD_STRICT,1.0}
+      imgsurf_reward_loose: ${oc.env:IMGSURF_REWARD_LOOSE,0.9}
 
 algorithm:
   adv_estimator: grpo
@@ -107,8 +107,8 @@ custom_reward_function:
     consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,1.0}
     exploration_weight: ${oc.env:IMGSURF_EXPLORATION_WEIGHT,1.0}
     iteration_weight: ${oc.env:IMGSURF_ITERATION_WEIGHT,1.0}
-    reward_strict_tool: ${oc.env:IMGSURF_REWARD_STRICT_TOOL,1.0}
-    reward_loose_tool: ${oc.env:IMGSURF_REWARD_LOOSE_TOOL,0.9}
+    reward_strict: ${oc.env:IMGSURF_REWARD_STRICT,1.0}
+    reward_loose: ${oc.env:IMGSURF_REWARD_LOOSE,0.9}
 
 reward_model:
   # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),
