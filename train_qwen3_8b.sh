@@ -8,7 +8,7 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
   --rollout-n=8 \
   --agent-workers=8 \
   --max-input-pixels=4194304 \
-  --full-dataset=on \
+  --dataset-mode=7 \
   --total-iterations=320 \
   --total-epochs=1 \
   "$@"

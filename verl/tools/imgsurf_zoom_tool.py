@@ -110,6 +110,17 @@ class ImgSurfZoomTool(BaseTool):
         y2 = max(0.0, min(float(height), box[3]))
         return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
 
+    @staticmethod
+    def _integer_crop_box(box: list[float], image_size: tuple[int, int]) -> list[float]:
+        """Use the same round-and-clip policy as eval_hrbench_v4.py."""
+
+        width, height = image_size
+        left = max(0, min(int(round(box[0])), width - 1))
+        top = max(0, min(int(round(box[1])), height - 1))
+        right = max(left + 1, min(int(round(box[2])), width))
+        bottom = max(top + 1, min(int(round(box[3])), height))
+        return [float(left), float(top), float(right), float(bottom)]
+
     def _coordinates_to_window(
         self,
         box: list[float],
@@ -170,14 +181,15 @@ class ImgSurfZoomTool(BaseTool):
         self, image: Image.Image, box: list[float], max_pixels: int, model_family: str
     ) -> Image.Image:
         width, height = image.size
-        integer_box = (
-            max(0, int(math.floor(box[0]))),
-            max(0, int(math.floor(box[1]))),
-            min(width, int(math.ceil(box[2]))),
-            min(height, int(math.ceil(box[3]))),
-        )
+        integer_box = tuple(int(value) for value in self._integer_crop_box(box, image.size))
         crop = image.crop(integer_box)
         factor = self.resize_factor_qwen3 if model_family == "qwen3_vl" else self.resize_factor_qwen2
+        # eval_hrbench_v4.py uses MIN_PIXELS=(2*IMAGE_FACTOR)^2.  The
+        # launcher default is 4096 for Qwen3; use the Qwen2.5 factor-specific
+        # minimum when the same default is in effect.
+        min_pixels = self.min_pixels
+        if model_family == "qwen2_5_vl" and self.min_pixels == 4096:
+            min_pixels = (2 * factor) ** 2
         new_width = max(factor, round(crop.width / factor) * factor)
         new_height = max(factor, round(crop.height / factor) * factor)
         pixels = max(1, crop.width * crop.height)
@@ -185,8 +197,8 @@ class ImgSurfZoomTool(BaseTool):
             beta = math.sqrt(pixels / max_pixels)
             new_width = max(factor, math.floor(crop.width / beta / factor) * factor)
             new_height = max(factor, math.floor(crop.height / beta / factor) * factor)
-        elif new_width * new_height < self.min_pixels:
-            beta = math.sqrt(self.min_pixels / pixels)
+        elif new_width * new_height < min_pixels:
+            beta = math.sqrt(min_pixels / pixels)
             new_width = max(factor, math.ceil(crop.width * beta / factor) * factor)
             new_height = max(factor, math.ceil(crop.height * beta / factor) * factor)
         if crop.size != (new_width, new_height):
@@ -210,7 +222,13 @@ class ImgSurfZoomTool(BaseTool):
     def _refinement_observation(self, state: dict[str, Any]) -> tuple[ToolResponse, dict[str, Any]]:
         k_values = self._k_values()
         k_level = k_values[state["iterations"]]
-        window = self._expanded_window(state["current"], state["image"].size, k_level)
+        # Quantize the region before storing it as the active coordinate
+        # system.  eval_hrbench_v4.py rounds/clips I_bbox before both cropping
+        # and mapping the next local bbox back to the original image.
+        window = self._integer_crop_box(
+            self._expanded_window(state["current"], state["image"].size, k_level),
+            state["image"].size,
+        )
         crop = self._resize_crop(
             state["image"],
             window,
@@ -239,7 +257,12 @@ class ImgSurfZoomTool(BaseTool):
     def _final_observation(
         self, state: dict[str, Any], final_box: list[float]
     ) -> tuple[ToolResponse, dict[str, Any]]:
-        crop = self._resize_crop(state["image"], final_box, self.max_pixels, state["model_family"])
+        crop = self._resize_crop(
+            state["image"],
+            final_box,
+            self.max_pixels,
+            state["model_family"],
+        )
         rounded = [int(round(value)) for value in final_box]
         text = (
             f"Final refined crop; original-image bbox={rounded}; iterations={state['iterations']}; "

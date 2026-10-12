@@ -370,7 +370,8 @@ def run_zoom_loop_for_region(
             messages.append({"role": "assistant", "content": response_message})
 
             think_blocks.append(extract_think_blocks(response_message))
-            bbox_local, _ = parse_first_bbox_from_response(response_message)
+            image_bounds = (0, 0, 1000, 1000) if int(args.qwen_ver) == 3 else (0, 0, new_w, new_h)
+            bbox_local, _ = parse_first_bbox_from_response(response_message, image_bounds)
             if int(args.qwen_ver) == 3: new_w, new_h = 1000.0, 1000.0
             if bbox_local is None: bbox_local = [0, 0, new_w, new_h]
 
@@ -467,7 +468,8 @@ def process(idx_arg):
             "meta": "step1_think_and_tool_calls",
         })
 
-        screened_regions = screen_tool_call_regions(response_message)
+        image_bounds = (0, 0, 1000, 1000) if int(args.qwen_ver) == 3 else (0, 0, resize_w, resize_h)
+        screened_regions = screen_tool_call_regions(response_message, image_bounds)
         print_messages.append({
             "role": "user",
             "content": "[Chain step 2] Screening: retained {} region(s). Regions: {}".format(

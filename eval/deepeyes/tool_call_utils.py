@@ -4,6 +4,7 @@ Do not use eval() for string parsing.
 """
 
 import json
+import math
 import re
 
 START_TOKEN = "<tool_call>"
@@ -56,7 +57,80 @@ def extract_bbox_label_from_json_str(s):
     )
 
 
-def screen_tool_call_regions(response_message):
+def _iter_tool_call_snippets(response_message):
+    """Yield all four tool-call forms in text order, including unclosed tails."""
+    starts = re.compile(r"<tool_call>|addCriterion")
+    boundaries = re.compile(r"<tool_call>|addCriterion|</tool_call>")
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while True:
+        marker = starts.search(response_message, cursor)
+        if marker is None:
+            return
+        start = marker.end()
+        boundary = boundaries.search(response_message, start)
+        end = boundary.start() if boundary else len(response_message)
+        json_start = response_message.find("{", start, end)
+        if json_start != -1:
+            try:
+                # Decode the complete object before looking for further tags:
+                # braces and tool markers inside a JSON label are plain text.
+                _, json_end = decoder.raw_decode(response_message, json_start)
+                end = json_end
+            except json.JSONDecodeError:
+                pass
+        yield response_message[start:end]
+        cursor = end
+
+
+def _repair_bbox_label(snippet, image_bounds):
+    """Parse one candidate, then repair its geometry in the displayed frame."""
+    json_start = snippet.find("{")
+    if json_start == -1:
+        return None, ""
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(snippet, json_start)
+    except json.JSONDecodeError:
+        return None, ""
+    if not isinstance(obj, dict):
+        return None, ""
+    arguments = obj.get("arguments", obj)
+    if not isinstance(arguments, dict):
+        return None, ""
+    label = arguments.get("label", "")
+    if not isinstance(label, str):
+        label = ""
+    bbox = arguments.get("bbox_2d")
+    try:
+        if isinstance(bbox, str):
+            bbox = json.loads(bbox)
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            return None, label
+        # Ignore coordinates after the first four before validating values.
+        bbox = bbox[:4]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float, str)) for value in bbox):
+            return None, label
+        bbox = [float(value) for value in bbox]
+    except (TypeError, ValueError, OverflowError):
+        return None, label
+    if not all(math.isfinite(value) for value in bbox):
+        return None, label
+    xmin, ymin, xmax, ymax = bbox[:4]
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    left, top, right, bottom = image_bounds
+    xmin = max(left, min(xmin, right))
+    ymin = max(top, min(ymin, bottom))
+    xmax = max(left, min(xmax, right))
+    ymax = max(top, min(ymax, bottom))
+    if xmin == xmax or ymin == ymax:
+        return None, label
+    return [xmin, ymin, xmax, ymax], label
+
+
+def screen_tool_call_regions(response_message, image_bounds=None):
     """
     Screen bbox_2d/label from step (1) output. Four cases:
     (a) toolCall: between "<tool_call>" and "</tool_call>"
@@ -65,7 +139,30 @@ def screen_tool_call_regions(response_message):
     (d) bad_addCriterion: has "addCriterion" but no "</tool_call>"
     Same label => same region A; keep only the first bbox_2d per label (by position in text).
     Returns: list of (bbox_2d, label) in order of first occurrence (by label).
+
+    With image_bounds=(left, top, right, bottom), repair each candidate before
+    deduplicating labels: truncate, reorder, clip, and discard zero-area boxes.
+    Calls without bounds retain the raw parsing used by the training validator.
     """
+    if image_bounds is not None:
+        bounds = [float(value) for value in image_bounds]
+        if (
+            len(bounds) != 4
+            or not all(math.isfinite(value) for value in bounds)
+            or bounds[0] >= bounds[2]
+            or bounds[1] >= bounds[3]
+        ):
+            raise ValueError("image_bounds must be a finite, positive-area (left, top, right, bottom)")
+        result = []
+        seen_labels = set()
+        for snippet in _iter_tool_call_snippets(response_message):
+            bbox, label = _repair_bbox_label(snippet, bounds)
+            key = label.strip().lower() if label else "__empty__"
+            if bbox is not None and key not in seen_labels:
+                seen_labels.add(key)
+                result.append((bbox, label))
+        return result
+
     candidates = []
 
     # (a) Full <tool_call>...</tool_call> blocks
@@ -272,14 +369,12 @@ def extract_think_blocks(text):
     return '\n\n'.join(m.strip() for m in matches if m.strip()) if matches else ""
 
 
-def parse_first_bbox_from_response(response_text):
+def parse_first_bbox_from_response(response_text, image_bounds=None):
     """
     Parse the first image_zoom_in_tool bbox from model response.
     Supports the same four formats as screen_tool_call_regions.
     Returns (bbox_2d, label) or (None, "") if not found.
     bbox_2d is in the coordinate system of the image shown to the model.
     """
-    regions = screen_tool_call_regions(response_text)
-    if not regions:
-        return (None, "")
-    return (regions[0][0], regions[0][1])
+    regions = screen_tool_call_regions(response_text, image_bounds)
+    return regions[0] if regions else (None, "")

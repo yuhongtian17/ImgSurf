@@ -49,8 +49,8 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 ```
 
 所有启动配置现在都有命令行参数。`--name=value` 与 `--name value` 两种形式均可；用
-`bash ./recipe/imgsurf/run_imgsurf_grpo.sh --help` 查看按路径、资源、训练、轨迹、预算、奖励和 judge
-分类后的完整参数表。对应的大写环境变量可作为次级配置来源。
+`bash ./recipe/imgsurf/run_imgsurf_grpo.sh --help` 查看按路径、资源、训练、轨迹、预算和奖励分类的完整
+参数表。对应的大写环境变量可作为次级配置来源。
 
 ## 两种 token 训练模式
 
@@ -69,30 +69,62 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh --reward-token outer
 
 合成的 zoom-out 调用、用户消息、图像观察等环境 token 在两种模式下都不参与 loss。
 
-## 两种语义奖励
+## accuracy judge 两种模式
 
-默认 `rule` 使用保守的确定性规则：严格选项匹配、Yes/No、数值、方向关系（含主客体顺序）、短答案
-以及高阈值 token/order 匹配。规则无法确认时记为错误，不会把高词汇重叠自动当成正确：
+指定 `--judge-base-url` 时，CPU reward manager 调用外部 OpenAI-compatible VLM。可同时指定
+`--judge-model`、`--judge-api-key`、`--judge-timeout`、`--judge-max-retries` 和
+`--judge-max-pixels`。外部 judge 使用独立对话，不携带策略轨迹；配置了 URL 时数据集才会编码并发送
+原图。
+
+不指定 `--judge-base-url` 时，每条 rollout 执行“策略 inference（包含 zoom loop）→ 独立 judge → 返回
+奖励 metadata”。judge 使用当前 rollout 引擎和当前模型快照，只发送问题、标准答案和模型回答，不发送
+原图或策略轨迹。judge 的 prompt/output token 是临时局部变量，不追加到策略 `response_ids`，也不写入
+`response_mask`。完成本批 rollout 后训练器才执行 actor update，下一批 rollout 使用更新后的权重。
+
+两种模式的 judge 都只返回 `CORRECT`/`INCORRECT`；请求失败、输出无法识别或最终 answer 不存在时，
+`reward_accuracy=0`，不会退回规则匹配。
+
+当 0 号卡专门部署外部 judge、其余 7 卡训练时，先在 0 号卡启动服务：
 
 ```bash
-bash ./recipe/imgsurf/run_imgsurf_grpo.sh --semantic-reward rule
+CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
+  --model-path=/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct \
+  --tp-size=1 \
+  --context-length=32768 \
+  --port=18901 \
+  --trust-remote-code \
+  --log-requests false
 ```
 
-`judge` 把问题、参考答案、候选答案以及压缩后的原图发送到 OpenAI-compatible VLM。judge 应部署在
-训练 Ray 集群之外，以免占用八张训练卡：
+另开终端确认服务可用：
 
 ```bash
+curl http://127.0.0.1:18901/v1/models
+```
+
+然后只让 1~7 号卡参与训练。7 卡时应显式把总 GPU、每节点 GPU、rollout worker 和 batch 参数改为
+7 卡对应值：
+
+```bash
+ray stop --force
 bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
-  --semantic-reward=judge \
-  --judge-base-url=http://judge-host:18901/v1 \
+  --model-path=/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct \
+  --data-root=/home/dataset-assist-0/workspace/deepeyes271/DeepEyes-Datasets-47k \
+  --output-root=/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf_qwen3_8b_7train \
+  --cuda-visible-devices=1,2,3,4,5,6,7 \
+  --total-gpus=7 \
+  --gpus-per-node=7 \
+  --rollout-tp-size=1 \
+  --agent-workers=7 \
+  --train-batch-size=56 \
+  --ppo-mini-batch-size=28 \
+  --judge-base-url=http://127.0.0.1:18901/v1 \
   --judge-model=Qwen3-VL-8B-Instruct \
   --judge-api-key=EMPTY
 ```
 
-可选参数：`--judge-timeout`（默认 60 秒）、`--judge-max-retries`（默认 2）、
-`--judge-max-pixels`（默认 1,048,576）。judge 请求失败时该样本 accuracy 为 0，并记录警告，不会退回
-较宽松的规则而造成奖励口径漂移。真实 API key 用命令行传入时会留在 shell 历史中；敏感环境下可继续
-使用兼容的 `IMGSURF_JUDGE_API_KEY` 环境变量。
+这里 judge 服务独占物理 0 号卡，训练进程只看到物理 1~7 号卡；`56=7×8`、`28=7×4`，满足
+launcher 对全局 batch 与 GPU 数量整除关系的检查。
 
 ## 格式、工具与一致性奖励
 
@@ -101,53 +133,52 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 `<answer>...</answer>`；中间 response 必须包含可被 `screen_tool_call_regions` 解析的
 `tool_call`。格式奖励不再强制要求 `<think>...</think>`。
 
-工具调用沿用 `screen_tool_call_regions` 的四种解析情况：严格闭合的
-`<tool_call>...</tool_call>` 得到 `--reward-strict`（或 `--reward_strict`，默认 `1.0`），另外三种非严格闭合但仍能
-解析出区域的形式得到 `--reward-loose`（或 `--reward_loose`，默认 `0.9`），无法解析则为 `0`。格式奖励会校验
-bbox 是否为四个有限数、非负、坐标顺序正确且不超过当前坐标范围；不会评价 bbox 的大小、重叠或定位质量。`<answer>...</answer>`
-必须严格闭合且内容非空，否则该 response 的基础格式奖励为 `0`。
-Qwen3-VL 的当前坐标范围是 `[0,1000]`，Qwen2.5-VL 使用当前展示图的像素宽高。
+工具调用沿用 `screen_tool_call_regions` 的四种解析情况。严格闭合的
+`<tool_call>...</tool_call>` 得到 `--reward_strict_tool`（默认 `1.0`），其余三种非严格闭合但仍能解析出合法区域的形式得到
+`--reward_loose_tool`（默认 `0.9`），无法解析则为 `0`。bbox 只校验四元数、有限性、非负、坐标顺序
+和当前坐标范围，不评价区域内容质量。第一次 response 如果工具解析失败但 answer 严格闭合，得到
+`--reward_direct_answer`（默认 `0.8`）；中间 response 只接受工具；最后 response 只接受严格闭合的
+answer。严格闭合的 `<think>...</think>` 会再乘以 `--reward_strict_think`（默认 `1.1`），没有严格
+think 时乘数为 `1.0`。
 
-两个参数对应环境变量 `IMGSURF_REWARD_STRICT` 和 `IMGSURF_REWARD_LOOSE`。
+对应环境变量为 `IMGSURF_REWARD_STRICT_TOOL`、`IMGSURF_REWARD_LOOSE_TOOL`、
+`IMGSURF_REWARD_DIRECT_ANSWER` 和 `IMGSURF_REWARD_STRICT_THINK`。训练提示词仍显式要求 think，并继续使用与 `eval_hrbench_v4.py`
+对齐的推理、zoom-out、refinement 和最终回答提示词。
 
-在基础格式奖励之上，若 response 中的 `<think>...</think>` 标签全部严格配对，则乘以
-`--reward-strict`；否则乘以 `--reward-loose`。因此没有 think 的合法 response 仍然有效，但按
-宽松 think 系数计分。训练提示词仍显式要求模型先思考，并继续使用与 `eval_*_v4.py` 对齐的
-推理、zoom-out、refinement 和最终回答提示词；这里只是不把 think 标签作为格式奖励的硬门槛。
-基础格式和 think 乘数共同决定该 response 的分数。
+`reward_exploration` 表示第一次 response 是否解析到了合法的初始 `image_zoom_in_tool` 区域。解析到
+时基础值为 `1`，答案错误时乘以 `--inaccuracy_exploration`（默认 `0.5`），答案正确时乘以 `1`。
 
-`reward_exploration` 表示是否解析到了合法的初始 `image_zoom_in_tool` 区域，但只有
-`reward_accuracy == 1` 时才计算；答案错误时 `reward_exploration=0`，也不再继续判断定位信息。
+`reward_consistency` 表示 refinement 最终是否达到 `IoU > iou_thr`。达到时基础值为 `1`，答案错误时
+乘以 `--inaccuracy_consistency`（默认 `0`），答案正确时乘以 `1`。
 
-一致性分数同样以 `reward_accuracy == 1` 为前提：在合法 refinement 最终达到 `IoU > iou_thr`
-时为 `1`，否则为 `0`。当 `reward_exploration == 1` 时，轨迹必然进入 zoom loop，令
-`len_k_list = max_iter * max_level`，根据跳出循环时的 `iter_idx=0,1,...,len_k_list-1` 计算：
+只要第一次 response 解析出合法初始区域，就进入 zoom loop。令
+`len_k_list = max_iter * max_level`，根据跳出循环时的 `iter_idx=0,1,...,len_k_list-1` 计算基础值：
 
 ```text
 reward_iteration = max(0, len_k_list - 1 - iter_idx) / max(1, len_k_list - 1)
 ```
 
-代码先判断 `reward_exploration`：如果为 `0`，`reward_iteration` 直接为 `0`，不会继续读取
-`iteration_idx`；只有为 `1` 时才使用上式，越早达到一致性或结束循环，iteration 奖励越高。
-当 `len_k_list=1` 时，iteration 奖励为 `0`。
+如果没有合法初始区域，`reward_iteration` 直接为 `0`；否则基础值再按答案正确性乘以 `1` 或
+`--inaccuracy_iteration`（默认 `0`）。当 `len_k_list=1` 时，iteration 基础值为 `0`。
 
 当前总奖励为：
 
 ```text
-R = accuracy_weight * accuracy
-  + format_weight * mean(response_format_scores)
-  + consistency_weight * consistency
+R = accuracy_weight * reward_accuracy
+  + format_weight * reward_format
+  + consistency_weight * reward_consistency
   + exploration_weight * reward_exploration
   + iteration_weight * reward_iteration
 ```
 
 默认权重为 `accuracy=1.0`、`format=1.0`、`consistency=1.0`、`exploration=1.0`、`iteration=1.0`。
-`reward_exploration` 和 `reward_iteration` 都属于 `[0,1]`。权重可通过
+权重可通过
 `--accuracy-weight`、`--format-weight`、`--consistency-weight`、`--exploration-weight` 和
 `--iteration-weight` 调整。
 
 五项默认权重相同，分别鼓励答案正确、格式合法、定位收敛、使用有效初始工具以及尽早完成定位循环。
-建议先使用默认组，观察 accuracy、format、exploration、consistency 和 reward_iteration 的独立日志后再调整。
+建议先使用默认组，观察 reward_accuracy、reward_format、reward_exploration、reward_consistency 和
+reward_iteration 的独立日志后再调整。
 
 初始 response 含有工具调用时，即使同时包含一个临时 answer，也仍会进入 v4 的 zoom loop，最后由最终
 response 重新回答；初始只有 answer 时才跳过定位。训练提示词、坐标系和循环参数与 `eval_*_v4.py`
@@ -173,6 +204,8 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 - Qwen3-VL：初始图和每张扩展裁剪的 `zoom_in` 坐标均归一化到 `[0,1000]`；
 - Qwen2.5-VL：`zoom_in` 使用当前实际展示图的像素范围，x 属于 `[0,w]`，y 属于 `[0,h]`；
 - 两种模型最终都映射回原图坐标做扩展、IoU 和最终裁剪；
+- 图像缩放沿用 v4 的 `IMAGE_FACTOR`（Qwen3 为 32、Qwen2.5 为 28）和最小 2 patch；训练像素预算
+  仍由 `--max-input-pixels`/`--max-tool-pixels` 控制，避免无意中突破上下文预算；
 - 模型族由 checkpoint 的 `config.json:model_type` 检测，脚本会拒绝不一致的手工设置。
 
 Qwen3-VL 的初始请求和每次 refinement 用户消息都会再次明确写出“使用 `[0,1000]` 归一化
@@ -242,8 +275,14 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 常用资源参数包括 `--total-gpus`（默认 8）、`--nnodes`（默认 1）、`--gpus-per-node`、
 `--rollout-tp-size`（默认 1）、`--train-batch-size`（默认每卡 8 prompt）、
-`--ppo-mini-batch-size`（默认全局 prompt batch 的一半）、`--rollout-n`、`--agent-workers`、`--full-dataset` 和
+`--ppo-mini-batch-size`（默认全局 prompt batch 的一半）、`--rollout-n`、`--agent-workers`、`--dataset-mode` 和
 `--max-input-pixels`。多节点还可指定 `--ray-address`；本机卡号可用 `--cuda-visible-devices` 限制。
+
+`--dataset-mode` 用 1 到 7 的三位二进制掩码选择训练子集。最低位（`1`）是
+ThinkLite-VL，中间位（`2`）是 ArxivQA，最高位（`4`）是 Vstar；多个子集可以按位或组合。
+例如 `--dataset-mode=6`（二进制 `110`）使用 Vstar 和 ArxivQA，不使用 ThinkLite-VL，默认值
+`7` 使用三个子集。Vstar 数据文件同时作为固定验证集，因此即使训练模式不包含 Vstar，仍需保留
+`data_0.1.2_visual_toolbox_v2.parquet`。
 
 八卡默认全局 prompt batch 为 `64`（每卡 `8`）。`train_qwen3_8b.sh`、`train_qwen3_4b.sh` 和
 `train_qwen25_7b.sh` 默认传入 `--total-iterations 320`；指定 `--total-iterations 320` 时，
@@ -257,7 +296,7 @@ launcher 通过 `trainer.total_training_steps=320` 在 320 个 global step 后�
 
 ```bash
 bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
-  --full-dataset=off \
+  --dataset-mode=5 \
   --total-gpus=2 \
   --train-batch-size=8 \
   --ppo-mini-batch-size=8 \

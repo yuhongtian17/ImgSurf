@@ -87,8 +87,10 @@ actor_rollout_ref:
       imgsurf_max_turn_tokens: ${oc.env:IMGSURF_MAX_TURN_TOKENS,1024}
       imgsurf_min_final_tokens: ${oc.env:IMGSURF_MIN_FINAL_TOKENS,512}
       imgsurf_max_think_summary_tokens: ${oc.env:IMGSURF_MAX_THINK_SUMMARY_TOKENS,512}
-      imgsurf_reward_strict: ${oc.env:IMGSURF_REWARD_STRICT,1.0}
-      imgsurf_reward_loose: ${oc.env:IMGSURF_REWARD_LOOSE,0.9}
+      imgsurf_reward_strict_tool: ${oc.env:IMGSURF_REWARD_STRICT_TOOL,1.0}
+      imgsurf_reward_loose_tool: ${oc.env:IMGSURF_REWARD_LOOSE_TOOL,0.9}
+      imgsurf_reward_direct_answer: ${oc.env:IMGSURF_REWARD_DIRECT_ANSWER,0.8}
+      imgsurf_reward_strict_think: ${oc.env:IMGSURF_REWARD_STRICT_THINK,1.1}
 
 algorithm:
   adv_estimator: grpo
@@ -101,18 +103,18 @@ custom_reward_function:
   path: recipe/imgsurf/imgsurf.py
   name: compute_score
   reward_kwargs:
-    semantic_reward: ${oc.env:IMGSURF_SEMANTIC_REWARD,rule}
     accuracy_weight: ${oc.env:IMGSURF_ACCURACY_WEIGHT,1.0}
     format_weight: ${oc.env:IMGSURF_FORMAT_WEIGHT,1.0}
     consistency_weight: ${oc.env:IMGSURF_CONSISTENCY_WEIGHT,1.0}
     exploration_weight: ${oc.env:IMGSURF_EXPLORATION_WEIGHT,1.0}
     iteration_weight: ${oc.env:IMGSURF_ITERATION_WEIGHT,1.0}
-    reward_strict: ${oc.env:IMGSURF_REWARD_STRICT,1.0}
-    reward_loose: ${oc.env:IMGSURF_REWARD_LOOSE,0.9}
+    inaccuracy_exploration: ${oc.env:IMGSURF_INACCURACY_EXPLORATION,0.5}
+    inaccuracy_consistency: ${oc.env:IMGSURF_INACCURACY_CONSISTENCY,0.0}
+    inaccuracy_iteration: ${oc.env:IMGSURF_INACCURACY_ITERATION,0.0}
 
 reward_model:
-  # ImgSurf uses a CPU rule reward (and optionally an external HTTP judge),
-  # so no local GPU reward-model worker is allocated.
+  # With --judge-base-url the CPU reward manager calls the external VLM;
+  # otherwise it consumes the scalar produced by the live rollout judge.
   enable: false
   reward_manager: imgsurf
   launch_reward_fn_async: false

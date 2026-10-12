@@ -14,14 +14,13 @@ from eval.deepeyes.tool_call_utils import screen_tool_call_regions as _eval_scre
 
 
 USER_PROMPT_STEP1 = (
-    "\nThink first, call **image_zoom_in_tool** if needed, then answer. "
-    "Format as: <think>...</think> <tool_call>...</tool_call> (if tools needed) "
-    "<answer>...</answer>."
+    "\nThink first, call **image_zoom_in_tool** if needed, then answer. Format strictly as:  "
+    "<think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>...</answer> "
 )
 
 USER_PROMPT_STEP10_NO_CROPS = (
-    "\nBased on your previous thinking, give your final answer. "
-    "Format as: <think>...</think> <answer>...</answer>."
+    "\nBased on your previous thinking, give your final answer. Format strictly as:  "
+    "<think>...</think>  <answer>...</answer> "
 )
 
 
@@ -253,13 +252,12 @@ def build_refine_user_text(
         question = f"Question: {question}"
     return (
         f"{question}\nLabel: {label}\n"
-        f"Ignore all previous thinking. You are shown an image I{index}. For the question and the "
-        f"given label, think and call **image_zoom_in_tool** to output exactly one rectangular crop "
-        f"region R{index + 1} (bbox_2d) that best matches the question and label. "
-        f"If you output multiple regions, only the first will be used. "
-        f"The bbox_2d coordinates must be relative to the image you see (I{index}). "
+        f"Ignore all previous thinking. You are shown an image I{index}. For the question and the given label, "
+        f"think and call **image_zoom_in_tool** to output exactly one rectangular crop region R{index + 1} "
+        f"(bbox_2d) that best matches the question and label. If you output multiple regions, only the first will be used. "
+        f"The bbox_2d coordinates must be relative to the image you see (I{index}).\n"
         f"{coordinate_description(model_family, width, height)}\n"
-        "Format strictly as: <think>...</think> <tool_call>...</tool_call>."
+        "Format strictly as:  <think>...</think>  <tool_call>...</tool_call> "
     )
 
 
@@ -268,7 +266,7 @@ def build_final_user_text(think_summary: str, question: str = "") -> str:
     return (
         "Based on the cropped region(s) shown above and the following thinking from previous steps:\n\n"
         f"{summary}\n\nReview and give your final answer. Choose one option that best fits. "
-        "Format strictly as: <think>...</think> <answer>...</answer>."
+        "Format strictly as:  <think>...</think>  <answer>...</answer> "
     )
 
 
@@ -310,10 +308,9 @@ def response_format_quality(
 ) -> str:
     """Classify one response without requiring a ``<think>`` block.
 
-    The basic trajectory rules are checked first.  A parsed tool call receives
-    strict/loose quality according to its envelope; an answer-only response is
-    valid with quality ``answer``.  ``<think>`` is handled separately by
-    :func:`response_format_score` as a multiplier.
+    ``tool_quality`` is supplied by the rollout parser when available.  The
+    parser deliberately separates tool envelope quality from bbox validity:
+    the latter is decided by :func:`screen_tool_call_regions`.
     """
     if not isinstance(text, str) or not text.strip():
         return "invalid"
@@ -322,8 +319,7 @@ def response_format_quality(
     text = text.strip()
     answer, has_answer = _answer_span(text)
     answer_marked = bool(re.search(r"</?answer>", text, flags=re.IGNORECASE))
-    if answer_marked and not has_answer:
-        return "invalid"
+    answer_invalid = answer_marked and not has_answer
 
     # Remove a valid answer before asking the shared parser to find tool calls;
     # examples or text inside an answer must not become tool calls.
@@ -331,7 +327,6 @@ def response_format_quality(
     if answer is not None:
         tool_text = text[: answer.start()] + text[answer.end() :]
     regions = screen_tool_call_regions(tool_text, max_x=bbox_max_x, max_y=bbox_max_y)
-    has_tool_marker = bool(re.search(r"<tool_call>|addCriterion", tool_text))
     has_tool = bool(regions)
     if response_kind == "initial":
         if not (has_tool or has_answer):
@@ -340,17 +335,23 @@ def response_format_quality(
         if not has_tool:
             return "invalid"
     elif response_kind == "final":
-        if not has_answer:
+        if not has_answer or answer_invalid:
             return "invalid"
     else:
         raise ValueError(f"Unknown response kind: {response_kind}")
+
+    # The final response is scored only as an answer.  Any tool-like text in
+    # that response is outside the v4 final-answer contract.
+    if response_kind == "final":
+        return "answer"
+    # A valid initial tool call takes precedence over any answer block in the
+    # same response.  This mirrors eval_*_v4.py: a malformed provisional answer
+    # must not cancel an otherwise executable localization request.
     if not has_tool:
-        if has_tool_marker:
+        if answer_invalid:
             return "invalid"
         return "answer"
 
-    if has_tool_marker and not regions:
-        return "invalid"
     strict = all(strict_envelope for _, strict_envelope in regions)
     return "strict" if strict else "loose"
 
@@ -364,8 +365,10 @@ def response_format_score(
     bbox_max_x: float | None = 1000.0,
     bbox_max_y: float | None = 1000.0,
     tool_quality: str | None = None,
-    reward_strict: float = 1.0,
-    reward_loose: float = 0.9,
+    reward_strict_tool: float = 1.0,
+    reward_loose_tool: float = 0.9,
+    reward_direct_answer: float = 0.8,
+    reward_strict_think: float = 1.1,
 ) -> float:
     quality = response_format_quality(
         text,
@@ -380,12 +383,14 @@ def response_format_score(
     elif tool_quality in {"strict", "loose"} and quality in {"strict", "loose"}:
         quality = tool_quality
     base = {
-        "invalid": 0.0, "answer": 1.0,
-        "strict": float(reward_strict), "loose": float(reward_loose),
+        "invalid": 0.0,
+        "answer": float(reward_direct_answer) if response_kind == "initial" else 1.0,
+        "strict": float(reward_strict_tool),
+        "loose": float(reward_loose_tool),
     }[quality]
     if quality == "invalid":
         return 0.0
-    think_multiplier = float(reward_strict) if _strict_tag_pairs(text, "think") else float(reward_loose)
+    think_multiplier = float(reward_strict_think) if _strict_tag_pairs(text, "think") else 1.0
     return base * think_multiplier
 
 

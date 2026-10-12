@@ -10,6 +10,6 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
   --ppo-mini-batch-size=8 \
   --agent-workers=1 \
   --max-input-pixels=4194304 \
-  --full-dataset=on \
+  --dataset-mode=7 \
   --total-epochs=1 \
   "$@"

@@ -17,7 +17,8 @@ Paths and run identity:
   --model-path PATH                 Hugging Face model directory
   --data-root PATH                  DeepEyes dataset directory
   --output-root PATH                Checkpoint/log/tensorboard root
-  --full-dataset on|off             Include the chart subset (default: on)
+  --dataset-mode INT                Dataset bitmask 1..7: bit0=ThinkLite-VL,
+                                      bit1=ArxivQA, bit2=Vstar (default: 7)
   --model-family FAMILY             qwen3_vl or qwen2_5_vl; normally auto-detected
   --project-name NAME               Logger project name
   --experiment-name NAME            Run/checkpoint name
@@ -46,8 +47,6 @@ Training and rollout:
 
 ImgSurf trajectory:
   --reward-token all|outer          Reward outer + inner tokens (default: all)
-  --semantic-reward rule|judge
-                                      Deterministic rules (default) or VLM judge
   --k FLOAT                         v4 expansion base (default: 0.4)
   --iou-thr FLOAT                   v4 convergence threshold (default: 0.5)
   --max-iter INT                    v4 maximum iterations (default: 4)
@@ -71,19 +70,25 @@ Token and image budgets:
 Reward weights:
   --accuracy-weight FLOAT           Answer correctness (default: 1.0)
   --format-weight FLOAT             Mean response-format/tool validity (default: 1.0)
-  --consistency-weight FLOAT        Correct-answer localization convergence (default: 1.0)
-  --exploration-weight FLOAT        Valid initial zoom-in reward (default: 1.0)
-  --iteration-weight FLOAT          Correct-answer early-loop reward (default: 1.0)
-  --reward-strict FLOAT              Strict tool/think reward (default: 1.0; --reward_strict alias)
-  --reward-loose FLOAT               Loose tool/think reward (default: 0.9; --reward_loose alias)
+  --consistency-weight FLOAT        Localization convergence (default: 1.0)
+  --exploration-weight FLOAT        Initial zoom-in reward (default: 1.0)
+  --iteration-weight FLOAT          Early-loop reward (default: 1.0)
+  --reward_strict_tool FLOAT        Strict tool reward (default: 1.0)
+  --reward_loose_tool FLOAT         Non-strict tool reward (default: 0.9)
+  --reward_direct_answer FLOAT      Initial direct-answer reward (default: 0.8)
+  --reward_strict_think FLOAT       Strict think multiplier (default: 1.1)
+  --inaccuracy_exploration FLOAT    Exploration multiplier on wrong answers (default: 0.5)
+  --inaccuracy_consistency FLOAT    Consistency multiplier on wrong answers (default: 0.0)
+  --inaccuracy_iteration FLOAT      Iteration multiplier on wrong answers (default: 0.0)
 
-VLM judge:
-  --judge-base-url URL              Required when semantic-reward=judge
-  --judge-model NAME                Judge model (default: first model from judge server)
-  --judge-api-key KEY               OpenAI-compatible API key (default: EMPTY)
-  --judge-timeout FLOAT             Request timeout in seconds (default: 60)
-  --judge-max-retries INT           Retry count (default: 2)
-  --judge-max-pixels INT            Judge image budget (default: 1048576)
+Optional external judge:
+  --judge-base-url URL              OpenAI-compatible VLM endpoint; when omitted,
+                                    use the current rollout model as the judge
+  --judge-model NAME                External judge model (default: first server model)
+  --judge-api-key KEY               External judge API key (default: EMPTY)
+  --judge-timeout FLOAT             External judge timeout seconds (default: 60)
+  --judge-max-retries INT           External judge retry count (default: 2)
+  --judge-max-pixels INT            Max pixels sent to external judge (default: 1048576)
 
 Other:
   -h, --help                        Show this message
@@ -100,7 +105,7 @@ EOF
 MODEL_PATH=${MODEL_PATH:-/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct}
 DATA_ROOT=${DATA_ROOT:-/home/dataset-assist-0/workspace/deepeyes271/DeepEyes-Datasets-47k}
 OUTPUT_ROOT=${OUTPUT_ROOT:-/home/dataset-assist-0/workspace/deepeyes271/work_dirs/imgsurf}
-FULL_DATASET=${FULL_DATASET:-1}
+DATASET_MODE=${DATASET_MODE:-7}
 MODEL_FAMILY=${MODEL_FAMILY:-}
 PROJECT_NAME=${PROJECT_NAME:-}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-}
@@ -125,7 +130,6 @@ TOTAL_ITERATIONS=${TOTAL_ITERATIONS:-}
 RESUME_MODE=${RESUME_MODE:-auto}
 
 IMGSURF_REWARD_TOKEN=${IMGSURF_REWARD_TOKEN:-all}
-IMGSURF_SEMANTIC_REWARD=${IMGSURF_SEMANTIC_REWARD:-rule}
 IMGSURF_K=${IMGSURF_K:-0.4}
 IMGSURF_IOU_THR=${IMGSURF_IOU_THR:-0.5}
 IMGSURF_MAX_ITER=${IMGSURF_MAX_ITER:-4}
@@ -150,8 +154,13 @@ IMGSURF_FORMAT_WEIGHT=${IMGSURF_FORMAT_WEIGHT:-1.0}
 IMGSURF_CONSISTENCY_WEIGHT=${IMGSURF_CONSISTENCY_WEIGHT:-1.0}
 IMGSURF_EXPLORATION_WEIGHT=${IMGSURF_EXPLORATION_WEIGHT:-1.0}
 IMGSURF_ITERATION_WEIGHT=${IMGSURF_ITERATION_WEIGHT:-1.0}
-IMGSURF_REWARD_STRICT=${IMGSURF_REWARD_STRICT:-1.0}
-IMGSURF_REWARD_LOOSE=${IMGSURF_REWARD_LOOSE:-0.9}
+IMGSURF_REWARD_LOOSE_TOOL=${IMGSURF_REWARD_LOOSE_TOOL:-0.9}
+IMGSURF_REWARD_STRICT_TOOL=${IMGSURF_REWARD_STRICT_TOOL:-1.0}
+IMGSURF_REWARD_DIRECT_ANSWER=${IMGSURF_REWARD_DIRECT_ANSWER:-0.8}
+IMGSURF_REWARD_STRICT_THINK=${IMGSURF_REWARD_STRICT_THINK:-1.1}
+IMGSURF_INACCURACY_EXPLORATION=${IMGSURF_INACCURACY_EXPLORATION:-0.5}
+IMGSURF_INACCURACY_CONSISTENCY=${IMGSURF_INACCURACY_CONSISTENCY:-0.0}
+IMGSURF_INACCURACY_ITERATION=${IMGSURF_INACCURACY_ITERATION:-0.0}
 
 IMGSURF_JUDGE_BASE_URL=${IMGSURF_JUDGE_BASE_URL:-}
 IMGSURF_JUDGE_MODEL=${IMGSURF_JUDGE_MODEL:-}
@@ -164,7 +173,7 @@ declare -A FLAG_TO_VARIABLE=(
   [--model-path]=MODEL_PATH
   [--data-root]=DATA_ROOT
   [--output-root]=OUTPUT_ROOT
-  [--full-dataset]=FULL_DATASET
+  [--dataset-mode]=DATASET_MODE
   [--model-family]=MODEL_FAMILY
   [--project-name]=PROJECT_NAME
   [--experiment-name]=EXPERIMENT_NAME
@@ -186,7 +195,6 @@ declare -A FLAG_TO_VARIABLE=(
   [--total-iterations]=TOTAL_ITERATIONS
   [--resume-mode]=RESUME_MODE
   [--reward-token]=IMGSURF_REWARD_TOKEN
-  [--semantic-reward]=IMGSURF_SEMANTIC_REWARD
   [--k]=IMGSURF_K
   [--iou-thr]=IMGSURF_IOU_THR
   [--max-iter]=IMGSURF_MAX_ITER
@@ -209,10 +217,13 @@ declare -A FLAG_TO_VARIABLE=(
   [--consistency-weight]=IMGSURF_CONSISTENCY_WEIGHT
   [--exploration-weight]=IMGSURF_EXPLORATION_WEIGHT
   [--iteration-weight]=IMGSURF_ITERATION_WEIGHT
-  [--reward-strict]=IMGSURF_REWARD_STRICT
-  [--reward_strict]=IMGSURF_REWARD_STRICT
-  [--reward-loose]=IMGSURF_REWARD_LOOSE
-  [--reward_loose]=IMGSURF_REWARD_LOOSE
+  [--reward_strict_tool]=IMGSURF_REWARD_STRICT_TOOL
+  [--reward_loose_tool]=IMGSURF_REWARD_LOOSE_TOOL
+  [--reward_direct_answer]=IMGSURF_REWARD_DIRECT_ANSWER
+  [--reward_strict_think]=IMGSURF_REWARD_STRICT_THINK
+  [--inaccuracy_exploration]=IMGSURF_INACCURACY_EXPLORATION
+  [--inaccuracy_consistency]=IMGSURF_INACCURACY_CONSISTENCY
+  [--inaccuracy_iteration]=IMGSURF_INACCURACY_ITERATION
   [--judge-base-url]=IMGSURF_JUDGE_BASE_URL
   [--judge-model]=IMGSURF_JUDGE_MODEL
   [--judge-api-key]=IMGSURF_JUDGE_API_KEY
@@ -271,13 +282,11 @@ check_float() {
   fi
 }
 
-case "${FULL_DATASET,,}" in
-  on|true|1) FULL_DATASET=1 ;;
-  off|false|0) FULL_DATASET=0 ;;
-  *) echo "--full-dataset must be on or off" >&2; exit 2 ;;
-esac
+if ! is_positive_integer "${DATASET_MODE}" || ((DATASET_MODE < 1 || DATASET_MODE > 7)); then
+  echo "--dataset-mode must be an integer in [1,7]; received '${DATASET_MODE}'" >&2
+  exit 2
+fi
 case "${IMGSURF_REWARD_TOKEN}" in all|outer) ;; *) echo "--reward-token must be all or outer" >&2; exit 2 ;; esac
-case "${IMGSURF_SEMANTIC_REWARD}" in rule|judge) ;; *) echo "--semantic-reward must be rule or judge" >&2; exit 2 ;; esac
 case "${IMGSURF_EXPAND_MODE}" in quarter|ctr|bbox) ;; *) echo "--expand-mode must be quarter, ctr or bbox" >&2; exit 2 ;; esac
 
 for setting in IMGSURF_MAX_PROMPT_LENGTH IMGSURF_MAX_RESPONSE_LENGTH; do
@@ -327,14 +336,10 @@ check_float "${LEARNING_RATE}" 'x > 0' '--learning-rate must be positive'
 check_float "${IMGSURF_JUDGE_TIMEOUT}" 'x > 0' '--judge-timeout must be positive'
 for setting in IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT \
   IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT \
-  IMGSURF_REWARD_STRICT IMGSURF_REWARD_LOOSE; do
+  IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL IMGSURF_REWARD_DIRECT_ANSWER IMGSURF_REWARD_STRICT_THINK \
+  IMGSURF_INACCURACY_EXPLORATION IMGSURF_INACCURACY_CONSISTENCY IMGSURF_INACCURACY_ITERATION; do
   check_float "${!setting}" 'x >= 0' "${setting} must be non-negative"
 done
-if [[ "${IMGSURF_SEMANTIC_REWARD}" == judge && -z "${IMGSURF_JUDGE_BASE_URL}" ]]; then
-  echo "--semantic-reward=judge requires --judge-base-url" >&2
-  exit 2
-fi
-
 if ! is_positive_integer "${NNODES}"; then echo "--nnodes must be positive" >&2; exit 2; fi
 if [[ -z "${TOTAL_GPUS}" && -z "${GPUS_PER_NODE}" ]]; then
   GPUS_PER_NODE=8
@@ -405,17 +410,43 @@ fi
 PROJECT_NAME=${PROJECT_NAME:-imgsurf-${MODEL_SLUG}}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-grpo-${TOTAL_GPUS}gpu-${NNODES}node}
 VSTAR_DATA=${DATA_ROOT}/data_0.1.2_visual_toolbox_v2.parquet
-MATH_DATA=${DATA_ROOT}/data_thinklite_reasoning_acc.parquet
-CHART_DATA=${DATA_ROOT}/data_v0.8_visual_toolbox_v2.parquet
-for required_path in "${VSTAR_DATA}" "${MATH_DATA}"; do
-  if [[ ! -f "${required_path}" ]]; then echo "Missing required file: ${required_path}" >&2; exit 2; fi
-done
-if [[ "${FULL_DATASET}" == 1 ]]; then
-  if [[ ! -f "${CHART_DATA}" ]]; then echo "Missing chart subset: ${CHART_DATA}" >&2; exit 2; fi
-  TRAIN_FILES="[\"${VSTAR_DATA}\",\"${MATH_DATA}\",\"${CHART_DATA}\"]"
-else
-  TRAIN_FILES="[\"${VSTAR_DATA}\",\"${MATH_DATA}\"]"
+ARXIVQA_DATA=${DATA_ROOT}/data_v0.8_visual_toolbox_v2.parquet
+THINKLITE_DATA=${DATA_ROOT}/data_thinklite_reasoning_acc.parquet
+
+# Dataset mode bits follow the DeepEyes training convention:
+#   1 (001) ThinkLite-VL, 2 (010) ArxivQA, 4 (100) Vstar.
+# Keep Vstar available for the fixed validation file even when it is not a
+# selected training bit.
+if [[ ! -f "${VSTAR_DATA}" ]]; then
+  echo "Missing validation file: ${VSTAR_DATA}" >&2
+  exit 2
 fi
+SELECTED_TRAIN_FILES=()
+SELECTED_TRAIN_NAMES=()
+if ((DATASET_MODE & 4)); then
+  SELECTED_TRAIN_FILES+=("${VSTAR_DATA}")
+  SELECTED_TRAIN_NAMES+=("Vstar")
+fi
+if ((DATASET_MODE & 2)); then
+  SELECTED_TRAIN_FILES+=("${ARXIVQA_DATA}")
+  SELECTED_TRAIN_NAMES+=("ArxivQA")
+fi
+if ((DATASET_MODE & 1)); then
+  SELECTED_TRAIN_FILES+=("${THINKLITE_DATA}")
+  SELECTED_TRAIN_NAMES+=("ThinkLite-VL")
+fi
+for required_path in "${SELECTED_TRAIN_FILES[@]}"; do
+  if [[ ! -f "${required_path}" ]]; then
+    echo "Missing dataset file selected by --dataset-mode=${DATASET_MODE}: ${required_path}" >&2
+    exit 2
+  fi
+done
+TRAIN_FILES="["
+for selected_path in "${SELECTED_TRAIN_FILES[@]}"; do
+  if [[ "${TRAIN_FILES}" != "[" ]]; then TRAIN_FILES+=","; fi
+  TRAIN_FILES+="\"${selected_path}\""
+done
+TRAIN_FILES+="]"
 
 if [[ -z "${CUDA_VISIBLE_DEVICES}" ]]; then
   CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((GPUS_PER_NODE - 1)))
@@ -426,7 +457,7 @@ export TOKENIZERS_PARALLELISM=false
 export NCCL_DEBUG
 if [[ -n "${RAY_ADDRESS}" ]]; then export RAY_ADDRESS; fi
 
-export IMGSURF_REWARD_TOKEN IMGSURF_SEMANTIC_REWARD
+export IMGSURF_REWARD_TOKEN
 export IMGSURF_K IMGSURF_IOU_THR IMGSURF_MAX_ITER IMGSURF_MAX_LEVEL IMGSURF_EXPAND_MODE
 export IMGSURF_MAX_PROMPT_LENGTH IMGSURF_MAX_RESPONSE_LENGTH IMGSURF_MAX_MODEL_LEN
 export IMGSURF_MAX_BATCHED_TOKENS IMGSURF_MAX_TURN_TOKENS IMGSURF_MIN_FINAL_TOKENS
@@ -434,7 +465,8 @@ export IMGSURF_MAX_THINK_SUMMARY_TOKENS IMGSURF_MAX_ASSISTANT_TURNS IMGSURF_MAX_
 export IMGSURF_MAX_INPUT_PIXELS IMGSURF_MIN_TOOL_PIXELS IMGSURF_MAX_TOOL_PIXELS
 export IMGSURF_ACCURACY_WEIGHT IMGSURF_FORMAT_WEIGHT
 export IMGSURF_CONSISTENCY_WEIGHT IMGSURF_EXPLORATION_WEIGHT IMGSURF_ITERATION_WEIGHT
-export IMGSURF_REWARD_STRICT IMGSURF_REWARD_LOOSE
+export IMGSURF_REWARD_STRICT_TOOL IMGSURF_REWARD_LOOSE_TOOL IMGSURF_REWARD_DIRECT_ANSWER IMGSURF_REWARD_STRICT_THINK
+export IMGSURF_INACCURACY_EXPLORATION IMGSURF_INACCURACY_CONSISTENCY IMGSURF_INACCURACY_ITERATION
 export IMGSURF_JUDGE_BASE_URL IMGSURF_JUDGE_MODEL IMGSURF_JUDGE_API_KEY
 export IMGSURF_JUDGE_TIMEOUT IMGSURF_JUDGE_MAX_RETRIES IMGSURF_JUDGE_MAX_PIXELS
 
@@ -449,10 +481,17 @@ if ((NNODES > 1)) && [[ -z "${RAY_ADDRESS}" ]]; then
 fi
 
 mkdir -p "${OUTPUT_ROOT}/ckpts" "${OUTPUT_ROOT}/logs" "${OUTPUT_ROOT}/tensorboard"
-echo "ImgSurf: model=${MODEL_FAMILY}, reward_token=${IMGSURF_REWARD_TOKEN}, semantic_reward=${IMGSURF_SEMANTIC_REWARD}"
-echo "ImgSurf format rewards: strict=${IMGSURF_REWARD_STRICT}, loose=${IMGSURF_REWARD_LOOSE}"
+if [[ -n "${IMGSURF_JUDGE_BASE_URL}" ]]; then
+  ACCURACY_MODE=external_vlm_judge
+else
+  ACCURACY_MODE=same_weight_rollout_judge
+fi
+echo "ImgSurf: model=${MODEL_FAMILY}, reward_token=${IMGSURF_REWARD_TOKEN}, accuracy=${ACCURACY_MODE}"
+echo "ImgSurf format rewards: strict_tool=${IMGSURF_REWARD_STRICT_TOOL}, loose_tool=${IMGSURF_REWARD_LOOSE_TOOL}, direct_answer=${IMGSURF_REWARD_DIRECT_ANSWER}, strict_think=${IMGSURF_REWARD_STRICT_THINK}"
 echo "ImgSurf v4: k=${IMGSURF_K}, iou_thr=${IMGSURF_IOU_THR}, max_iter=${IMGSURF_MAX_ITER}, max_level=${IMGSURF_MAX_LEVEL}, expand=${IMGSURF_EXPAND_MODE}"
 echo "ImgSurf context: prompt=${IMGSURF_MAX_PROMPT_LENGTH}, response=${IMGSURF_MAX_RESPONSE_LENGTH}, model=${IMGSURF_MAX_MODEL_LEN}, batched=${IMGSURF_MAX_BATCHED_TOKENS}"
+SELECTED_DATASET_NAMES=$(IFS=,; echo "${SELECTED_TRAIN_NAMES[*]}")
+echo "ImgSurf datasets: mode=${DATASET_MODE}, selected=${SELECTED_DATASET_NAMES}"
 echo "ImgSurf resources: total_gpus=${TOTAL_GPUS}, nnodes=${NNODES}, gpus_per_node=${GPUS_PER_NODE}, rollout_tp=${ROLLOUT_TP_SIZE}"
 
 TRAINING_STEP_OVERRIDE=()
