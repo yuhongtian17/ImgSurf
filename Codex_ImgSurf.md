@@ -186,12 +186,9 @@ bash train_qwen3_8b.sh
 3. --dataset-mode控制子训练集的使用：接收1~7之间的正整数，转换为二进制，bit_0控制是否使用ThinkLite-VL数据、bit_1控制ArxivQA数据，bit_2控制Vstar数据（默认--dataset-mode=7）。
 4. --total-iterations优先于--total-epochs。run_imgsurf_grpo.sh中的--total-iterations默认为空，仅在具体train_*.sh脚本中设置为320。--total-epochs默认为1。--save-freq默认为80。
 5. 如果超参在多处被指定，确认优先级为“执行run_imgsurf_grpo.sh时以--[kwargs]方式的命令行传入 > run_imgsurf_grpo.sh内[KWARGS]样式的环境变量默认设定 > 其他yaml的默认设定 > 相关函数参数列表的默认设定”。
-6. 清理废弃代码与编译缓存。最后修订./recipe/imgsurf/README.md，并创建./recipe/imgsurf/revision.md总结本次的修订内容。
+6. 无需保留与先前版本的兼容性，并清理废弃代码与编译缓存。最后修订./recipe/imgsurf/README.md，并创建./recipe/imgsurf/revision.md总结本次的修订内容。
 
 注意代码仍在"./ImgSurf-dev/"目录下编写，保持与sCoT-main一致的文件结构（即"./ImgSurf-dev/"下仅保留差分代码，执行"cp -r ./ImgSurf-dev/* ./sCoT-main/"后可训练）
-
-
-无需保留与先前版本的兼容性，并
 
 ## Prompts
 

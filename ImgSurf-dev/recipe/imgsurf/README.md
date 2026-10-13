@@ -89,11 +89,14 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh --reward-token outer
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
   --model-path=/home/dataset-assist-0/workspace/deepeyes271/Qwen3-VL-8B-Instruct \
+  --served-model-name=Qwen3-VL-8B-Instruct \
+  --host=127.0.0.1 \
   --tp-size=1 \
   --context-length=32768 \
   --port=18901 \
+  --api-key=EMPTY \
   --trust-remote-code \
-  --log-requests false
+  --mem-fraction-static 0.85
 ```
 
 另开终端确认服务可用：
@@ -228,6 +231,7 @@ max_model_len       = 16384
 max_batched_tokens  = 8192
 max_turn_tokens     = 1024
 min_final_tokens    = 512
+save_freq           = 80
 ```
 
 修改示例：
@@ -248,12 +252,13 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
 
 从高到低为：
 
-1. 命令末尾不带 `--` 的原生 Hydra override；
-2. `run_imgsurf_grpo.sh` 的 `--kebab-case` 命令行参数；
-3. 调用前显式设置的环境变量；
-4. `run_imgsurf_grpo.sh` 中的默认值；
-5. `configs/*.yaml` 的兜底默认值；
-6. verl 上游默认配置。
+1. 执行 `run_imgsurf_grpo.sh` 时传入的 `--[kwargs]` 命令行参数；
+2. `run_imgsurf_grpo.sh` 内 `[KWARGS]` 变量的环境值或脚本默认值；
+3. `configs/*.yaml` 的兜底默认值；
+4. 相关函数参数列表的默认值。
+
+末尾不带 `--` 的原生 Hydra override 仍可用于上游字段，但当它与本启动器参数冲突时，启动器的显式
+`--[kwargs]` 参数优先。这样可以在不修改脚本的情况下临时覆盖上游字段，同时不会意外覆盖已选资源和奖励参数。
 
 例如：
 
@@ -269,7 +274,7 @@ bash ./recipe/imgsurf/run_imgsurf_grpo.sh \
   actor_rollout_ref.rollout.n=8
 ```
 
-实际使用 8。
+若同时指定启动器参数 `--rollout-n=4`，实际使用 4；只有未提供对应启动器参数时才使用该 Hydra 值。
 
 ## 资源与 smoke test
 

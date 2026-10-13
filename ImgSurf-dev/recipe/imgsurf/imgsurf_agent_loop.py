@@ -26,7 +26,7 @@ from recipe.imgsurf.prompt_utils import (
     build_refine_user_text,
     render_imgsurf_chat_prompt,
     response_format_score,
-    screen_tool_call_regions,
+    repaired_tool_call_regions,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, AgentLoopWorker, register
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
@@ -43,8 +43,8 @@ def _extract_think(text: str) -> str:
 
 def _extract_strict_answer(text: str) -> tuple[str, bool]:
     matches = re.findall(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.DOTALL | re.IGNORECASE)
-    opening_count = text.lower().count("<answer>")
-    closing_count = text.lower().count("</answer>")
+    opening_count = len(re.findall(r"<answer>", text, flags=re.IGNORECASE))
+    closing_count = len(re.findall(r"</answer>", text, flags=re.IGNORECASE))
     balanced = opening_count == closing_count == len(matches) == 1
     answer = matches[0].strip() if matches else ""
     return answer, bool(balanced and answer)
@@ -326,8 +326,11 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         model_family = state.get("model_family", "qwen3_vl")
         display = state.get("active_display_size") or state.get("initial_display_size") or (1000, 1000)
         max_x, max_y = (1000.0, 1000.0) if model_family == "qwen3_vl" else (float(display[0]), float(display[1]))
-        regions = screen_tool_call_regions(text, max_x=max_x, max_y=max_y)
-        has_tool_marker = "<tool_call>" in text.lower() or "addcriterion" in text.lower()
+        # Keep the evaluator's repaired region for execution, but retain the
+        # original geometry verdict for the independent format reward.
+        parse_text = re.sub(r"<answer>.*?</answer>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        regions, geometry_valid = repaired_tool_call_regions(parse_text, max_x=max_x, max_y=max_y)
+        has_tool_marker = "<tool_call>" in parse_text.lower() or "addcriterion" in parse_text.lower()
         has_closed_answer = bool(
             re.search(r"<answer>\s*.+?\s*</answer>", text, re.DOTALL | re.IGNORECASE)
         )
@@ -335,8 +338,8 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         strict_count = 0
         for arguments, strict in regions:
             strict_count += int(strict)
-            # Geometry has already been validated by the parser.  Preserve
-            # the model's coordinates; semantic bbox quality is not rewarded.
+            # Keep the evaluator-repaired coordinates for execution. Semantic
+            # bbox quality is not rewarded; original legality is tracked separately.
             box = [float(value) for value in arguments["bbox_2d"]]
             executable = {
                 "bbox_2d": box,
@@ -344,7 +347,11 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             }
             if tool.validate_parameters(instance_id, executable)[0]:
                 valid_arguments.append(executable)
-        tool_quality = "strict" if regions and strict_count == len(regions) else "loose" if regions else "none"
+        tool_quality = (
+            "strict" if regions and strict_count == len(regions) and geometry_valid else
+            "loose" if regions and geometry_valid else
+            "invalid" if regions else "none"
+        )
         if (
             has_tool_marker
             and not regions
@@ -362,6 +369,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         metadata["parsed_tool_calls"] += valid_count
         metadata["successful_tool_calls"] += valid_count
         metadata["invalid_tool_calls"] += max(0, attempts - valid_count)
+        metadata["last_tool_geometry_valid"] = bool(geometry_valid)
         format_value = response_format_score(
             text,
             response_kind,
@@ -434,6 +442,7 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
         }
 
         final_response_text = ""
+        initial_executable = False
         try:
             with simple_timer("tool_calls", metrics):
                 instance_id, _ = await tool.create(
@@ -476,8 +485,13 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
             # Match eval_*_v4.py precedence: a parsed initial tool call wins
             # over any answer in the same response. The provisional answer is
             # ignored and replaced by the final answer after localization.
-            if initial_calls:
-                metadata["initial_zoom_in_parsed"] = True
+            initial_executable = bool(initial_calls)
+            if initial_executable:
+                # Exploration is a reward for an originally legal region. The
+                # repaired call may still execute below, but does not earn it.
+                metadata["initial_zoom_in_parsed"] = bool(
+                    metadata.get("last_tool_geometry_valid", False)
+                )
                 # v4 ignores a provisional answer whenever the same initial
                 # response also contains an executable zoom-in call.
                 final_response_text = ""
@@ -581,10 +595,11 @@ class ImgSurfToolAgentLoop(ToolAgentLoop):
                     metadata["iteration_idx"] = completed_iterations - 1
                 metadata["converged"] = bool(
                     observation_meta.get("converged", False)
-                    and observation_meta.get("parsed_valid", True)
                 )
 
-            has_localization = bool(metadata.get("initial_zoom_in_parsed"))
+            # A repaired initial call still produces the v4 final crop and
+            # answer; only exploration/iteration use the original legality.
+            has_localization = bool(initial_executable)
             final_images = (
                 _images_from_response(observation)
                 if has_localization and observation is not None and observation_meta.get("done")

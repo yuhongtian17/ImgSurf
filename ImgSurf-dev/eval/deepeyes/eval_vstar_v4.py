@@ -367,9 +367,9 @@ def run_zoom_loop_for_region(
             messages.append({"role": "assistant", "content": response_message})
 
             think_blocks.append(extract_think_blocks(response_message))
-            image_bounds = (0, 0, 1000, 1000) if int(args.qwen_ver) == 3 else (0, 0, new_w, new_h)
-            bbox_local, _ = parse_first_bbox_from_response(response_message, image_bounds)
             if int(args.qwen_ver) == 3: new_w, new_h = 1000.0, 1000.0
+            image_bounds = (0, 0, new_w, new_h)
+            bbox_local, _ = parse_first_bbox_from_response(response_message, image_bounds)
             if bbox_local is None: bbox_local = [0, 0, new_w, new_h]
 
             scale_w, scale_h = (i_r - i_l) / new_w, (i_b - i_t) / new_h

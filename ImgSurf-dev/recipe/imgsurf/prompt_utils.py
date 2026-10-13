@@ -10,7 +10,11 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from eval.deepeyes.tool_call_utils import screen_tool_call_regions as _eval_screen_tool_call_regions
+from eval.deepeyes.tool_call_utils import (
+    _repair_bbox_label,
+    _iter_tool_call_snippets,
+    screen_tool_call_regions as _eval_screen_tool_call_regions,
+)
 
 
 USER_PROMPT_STEP1 = (
@@ -76,6 +80,68 @@ def screen_tool_call_regions(
         and "addCriterion" not in text
     )
     return [({"bbox_2d": bbox, "label": label}, strict) for bbox, label in safe_parsed]
+
+
+def repaired_tool_call_regions(
+    text: str, *, max_x: float | None = 1000.0, max_y: float | None = 1000.0
+) -> tuple[list[tuple[dict[str, Any], bool]], bool]:
+    """Return executable v4-repaired regions and original-geometry validity.
+
+    The evaluator clips/reorders a region before the next inference request.
+    Training follows that behavior while keeping the format reward tied to the
+    un-repaired four-number geometry.
+    """
+    bounds = None if max_x is None or max_y is None else (0.0, 0.0, float(max_x), float(max_y))
+    try:
+        repaired = _eval_screen_tool_call_regions(text, image_bounds=bounds)
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+        return [], False
+    # Judge only the candidates that survive the evaluator's repair and
+    # per-label deduplication. Invalid candidates are allowed to be skipped so
+    # a later valid region can still drive the zoom loop, matching v4.
+    selected_legal: dict[str, bool] = {}
+    for snippet in _iter_tool_call_snippets(text):
+        if bounds is not None:
+            repaired_bbox, label = _repair_bbox_label(snippet, bounds)
+            if repaired_bbox is None:
+                continue
+        else:
+            label = ""
+        start = snippet.find("{")
+        if start < 0:
+            continue
+        key = label.strip().lower() if label else "__empty__"
+        if key in selected_legal:
+            continue
+        legal = True
+        try:
+            obj = json.JSONDecoder().raw_decode(snippet, start)[0]
+            args = obj.get("arguments", obj) if isinstance(obj, dict) else None
+            bbox = args.get("bbox_2d") if isinstance(args, dict) else None
+            if isinstance(bbox, str):
+                bbox = json.loads(bbox)
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                legal = False
+            else:
+                values = [float(value) for value in bbox]
+                legal = (
+                    all(math.isfinite(value) for value in values)
+                    and values[0] >= 0
+                    and values[1] >= 0
+                    and values[2] > values[0]
+                    and values[3] > values[1]
+                    and (max_x is None or values[2] <= max_x)
+                    and (max_y is None or values[3] <= max_y)
+                )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            legal = False
+        selected_legal[key] = legal
+    raw_legal = bool(repaired) and all(
+        selected_legal.get(label.strip().lower() if label else "__empty__", False)
+        for _, label in repaired
+    )
+    strict = bool(repaired) and text.count("<tool_call>") == text.count("</tool_call>") and "addCriterion" not in text
+    return [({"bbox_2d": [float(v) for v in bbox], "label": label}, strict) for bbox, label in repaired], raw_legal
 
 
 # Copied verbatim from eval/deepeyes/eval_*_v4.py; covered by parity tests.
@@ -326,7 +392,9 @@ def response_format_quality(
     tool_text = text
     if answer is not None:
         tool_text = text[: answer.start()] + text[answer.end() :]
-    regions = screen_tool_call_regions(tool_text, max_x=bbox_max_x, max_y=bbox_max_y)
+    regions, geometry_valid = repaired_tool_call_regions(
+        tool_text, max_x=bbox_max_x, max_y=bbox_max_y
+    )
     has_tool = bool(regions)
     if response_kind == "initial":
         if not (has_tool or has_answer):
@@ -352,6 +420,10 @@ def response_format_quality(
             return "invalid"
         return "answer"
 
+    if response_kind == "initial" and has_answer and (not has_tool or not geometry_valid):
+        return "answer"
+    if has_tool and not geometry_valid:
+        return "invalid"
     strict = all(strict_envelope for _, strict_envelope in regions)
     return "strict" if strict else "loose"
 
@@ -378,7 +450,10 @@ def response_format_score(
         bbox_max_x=bbox_max_x,
         bbox_max_y=bbox_max_y,
     )
-    if tool_quality == "invalid":
+    # An initial response may contain an unparseable tool call and a valid
+    # answer.  It receives the direct-answer tier; the malformed tool must not
+    # erase that answer tier.  Refinement responses have no such fallback.
+    if tool_quality == "invalid" and not (response_kind == "initial" and quality == "answer"):
         quality = "invalid"
     elif tool_quality in {"strict", "loose"} and quality in {"strict", "loose"}:
         quality = tool_quality

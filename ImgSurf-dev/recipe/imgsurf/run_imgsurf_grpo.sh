@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ImgSurf v4-style GRPO launcher.
-# Precedence: raw Hydra override > launcher flag > environment > defaults here > YAML fallback.
+# Precedence: explicit launcher flag > environment/script defaults > YAML/function defaults.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)
@@ -40,7 +40,7 @@ Training and rollout:
   --rollout-gpu-memory-utilization FLOAT
                                       SGLang memory fraction (default: 0.50)
   --learning-rate FLOAT             Actor learning rate (default: 1.0e-6)
-  --save-freq INT                   Checkpoint interval (default: 100)
+  --save-freq INT                   Checkpoint interval (default: 80)
   --total-epochs INT                Training epochs (default: 1)
   --total-iterations INT            Training steps; takes precedence over total-epochs
   --resume-mode MODE                verl resume mode (default: auto)
@@ -95,8 +95,8 @@ Other:
 
 Both '--flag value' and '--flag=value' are accepted. The corresponding
 uppercase environment variables are secondary inputs, and flags take precedence.
-Arguments without a leading '--' are forwarded as raw Hydra overrides and have
-the highest precedence.
+Arguments without a leading '--' are forwarded as raw Hydra overrides. Explicit
+launcher flags still take precedence over conflicting raw overrides.
 EOF
 }
 
@@ -124,7 +124,7 @@ PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-}
 ROLLOUT_N=${ROLLOUT_N:-8}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.50}
 LEARNING_RATE=${LEARNING_RATE:-1.0e-6}
-SAVE_FREQ=${SAVE_FREQ:-100}
+SAVE_FREQ=${SAVE_FREQ:-80}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 TOTAL_ITERATIONS=${TOTAL_ITERATIONS:-}
 RESUME_MODE=${RESUME_MODE:-auto}
@@ -498,10 +498,18 @@ TRAINING_STEP_OVERRIDE=()
 if [[ -n "${TOTAL_ITERATIONS}" ]]; then
   TRAINING_STEP_OVERRIDE=("trainer.total_training_steps=${TOTAL_ITERATIONS}")
 fi
+# The upstream trainer iterates over epochs and checks total_training_steps
+# inside that loop.  Give an explicit step budget enough epochs to reach it;
+# total_training_steps remains the stopping condition and therefore wins.
+EFFECTIVE_TOTAL_EPOCHS=${TOTAL_EPOCHS}
+if [[ -n "${TOTAL_ITERATIONS}" && ${EFFECTIVE_TOTAL_EPOCHS} -lt ${TOTAL_ITERATIONS} ]]; then
+  EFFECTIVE_TOTAL_EPOCHS=${TOTAL_ITERATIONS}
+fi
 
 python -m verl.trainer.main_ppo \
   --config-path="${CONFIG_DIR}" \
   --config-name="${CONFIG_NAME}" \
+  "${HYDRA_OVERRIDES[@]}" \
   "data.train_files=${TRAIN_FILES}" \
   "data.val_files=[\"${VSTAR_DATA}\"]" \
   data.train_batch_size=${TRAIN_BATCH_SIZE} \
@@ -525,8 +533,7 @@ python -m verl.trainer.main_ppo \
   trainer.default_local_dir="${OUTPUT_ROOT}/ckpts/${EXPERIMENT_NAME}" \
   "+trainer.tensorboard_dir=${OUTPUT_ROOT}/tensorboard/${EXPERIMENT_NAME}" \
   trainer.save_freq=${SAVE_FREQ} \
-  trainer.total_epochs=${TOTAL_EPOCHS} \
+  trainer.total_epochs=${EFFECTIVE_TOTAL_EPOCHS} \
   "${TRAINING_STEP_OVERRIDE[@]}" \
   trainer.resume_mode=${RESUME_MODE} \
-  "${HYDRA_OVERRIDES[@]}" \
   2>&1 | tee "${OUTPUT_ROOT}/logs/${EXPERIMENT_NAME}.log"
