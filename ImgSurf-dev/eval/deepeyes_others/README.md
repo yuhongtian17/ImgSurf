@@ -204,13 +204,21 @@ python eval/deepeyes_others/mathvista_mini/judge_result_mathvista_mini.py \
   --prediction_file /data/work_dirs/deepeyes_others/qwen3-vl-8b/mathvista_mini/predictions_v4.jsonl
 ```
 
-`v0` requests a direct answer, `v2` requests brief reasoning and an answer, and
-`v4` requests a `<think>...</think>` block followed by one `<answer>...</answer>`.
-All versions use the same image data URL and normalized grounding coordinates;
-the version difference is therefore isolated to response formatting and makes
-comparisons reproducible.  Qwen3 uses the 0--1000 coordinates documented by its
-vision models; Qwen2.5 is asked for the same convention so the judge does not
-depend on a processor-specific resize.
+The v0/v2/v4 evaluators now follow the corresponding HR-Bench conversation
+protocol.  v0 repeatedly sends the crop returned by `image_zoom_in_tool` until
+an answer is produced.  v2 parses the initial regions, constructs the same
+`k_list`, performs the zoom-out crop and local zoom-in loop with IoU stopping,
+then sends the final crop(s) and accumulated thinking for the answer.  v4 does
+the same loop while preserving the synthetic `image_zoom_out_tool` messages in
+the conversation history.  The prompt variant is selected with
+`--prompt_ver 1|2|3` for DeepEyes, Qwen2.5-VL or Qwen3-VL system prompts.
+
+The v2/v4 scripts accept the HR-Bench-compatible arguments
+`--hrbench_path` (an alias of `--dataset_path`), `--qwen_ver`, `--prompt_ver`,
+`--k`, `--iou_thr`, `--max_iter`, `--max_level` and `--expand_mode`, in
+addition to the API/model/save arguments.  `eval.sh` and `eval_simple.sh`
+expose the same values through `PROMPT_VER`, `ZOOM_K`, `IOU_THR`, `MAX_ITER`,
+`MAX_LEVEL` and `EXPAND_MODE`.
 
 ## Files and outputs
 
@@ -219,6 +227,10 @@ Predictions are written to
 writes a sibling `<...>_judge.jsonl` and a compact
 `judge_result_<version>.json` with `count` and `accuracy`.  Failed API calls are
 kept with `status: "error"` and an error string, so a partial run can be
-diagnosed before it is repeated.  POPE additionally reports precision, recall,
-F1 and yes-ratio to match the official reporting convention.
+diagnosed before it is repeated.  In addition to the running `accuracy`, POPE
+reports the four official subset indicators `Adversarial`, `Popular`, `Random`
+and `Overall` in the summary JSON.  The summary also retains precision, recall,
+F1 and yes-ratio for compatibility with the usual POPE report.  Every evaluator
+shows a sample progress bar (or a line-based fallback when `tqdm` is not
+installed) labelled with its dataset and protocol version.
 

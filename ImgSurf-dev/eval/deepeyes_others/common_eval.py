@@ -18,8 +18,10 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import copy
 import io
 import json
+import math
 import os
 import pickle
 import re
@@ -30,9 +32,47 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 try:
+    from eval.deepeyes.tool_call_utils import (
+        clamp_bbox_to_image,
+        compute_I_level_bbox,
+        compute_iou,
+        extract_think_blocks,
+        parse_first_bbox_from_response,
+        screen_tool_call_regions,
+        bbox_min_envelope_multi,
+    )
+except ModuleNotFoundError:  # Running from the sCoT-main checkout.
+    try:
+        from deepeyes.tool_call_utils import (
+            clamp_bbox_to_image,
+            compute_I_level_bbox,
+            compute_iou,
+            extract_think_blocks,
+            parse_first_bbox_from_response,
+            screen_tool_call_regions,
+            bbox_min_envelope_multi,
+        )
+    except ModuleNotFoundError:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from deepeyes.tool_call_utils import (
+            clamp_bbox_to_image,
+            compute_I_level_bbox,
+            compute_iou,
+            extract_think_blocks,
+            parse_first_bbox_from_response,
+            screen_tool_call_regions,
+            bbox_min_envelope_multi,
+        )
+
+try:
     from PIL import Image
 except Exception:  # pragma: no cover - only needed when local images are used
     Image = None
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - the fallback below still reports progress
+    tqdm = None
 
 
 DATASET_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -68,6 +108,156 @@ IMAGE_KEYS = (
 )
 
 
+# These prompts intentionally mirror eval/deepeyes/eval_hrbench_v0.py,
+# eval_hrbench_v2.py and eval_hrbench_v4.py.  The additional benchmark
+# evaluators use the same conversation protocol even when their manifests are
+# not HR-Bench TSV files.
+SYSTEM_PROMPT_DEEPEYES = """You are a helpful assistant.
+
+# Tools
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type":"function","function":{"name":"image_zoom_in_tool","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label.","parameters":{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"label":{"type":"string","description":"The name or label of the object in the specified bounding box (optional)."}},"required":["bbox"]}}}
+</tools>
+
+# How to call a tool
+Return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+**Example**:  
+<tool_call>  
+{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  
+</tool_call>"""
+
+SYSTEM_PROMPT_QWEN25_V2 = """You are a helpful assistant.
+
+# Tools
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{
+    "type": "function",
+    "function": {
+        "name": "image_zoom_in_tool",
+        "description": "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) and an object label.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox_2d": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "The name or label of the object in the specified bounding box."
+                }
+            },
+            "required": ["bbox_2d", "label"]
+        }
+    }
+}
+</tools>
+
+# How to call a tool
+Return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+**Example**:
+<tool_call>{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}</tool_call>"""
+
+SYSTEM_PROMPT_QWEN3_V2 = """You are a helpful assistant.
+
+# Tools
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{
+    "type": "function",
+    "function": {
+        "name": "image_zoom_in_tool",
+        "description": "Zoom in on a specific region of an image by cropping it based on a bounding box (bbox_2d) and an object label.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox_2d": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner. The coordinates are normalized to [0,1000] relative to the image currently shown."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "The name or label of the object in the specified bounding box."
+                }
+            },
+            "required": ["bbox_2d", "label"]
+        }
+    }
+}
+</tools>
+
+# How to call a tool
+Return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+**Example**:
+<tool_call>{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}</tool_call>"""
+
+_ZOOM_OUT_SCHEMA = '''
+{
+    "type": "function",
+    "function": {
+        "name": "image_zoom_out_tool",
+        "description": "Based on the original image with the latest zoom-in region, zoom out to a region of the original image by cropping it based on a bounding box (bbox_2d) and an index.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bbox_2d": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 4,
+                    "maxItems": 4,
+                    "description": "The bounding box of the zoom-out region, as [x1, y1, x2, y2]. The coordinates are relative to the original image."
+                },
+                "index": {
+                    "type": "string",
+                    "description": "The index of the zoom-out region, e.g. I1, I2, etc."
+                }
+            },
+            "required": ["bbox_2d", "index"]
+        }
+    }
+}'''
+
+SYSTEM_PROMPT_QWEN25_V4 = SYSTEM_PROMPT_QWEN25_V2.replace(
+    "<tools>\n{", "<tools>\n[{", 1
+).replace("\n</tools>", f",\n{_ZOOM_OUT_SCHEMA}\n]</tools>", 1)
+SYSTEM_PROMPT_QWEN3_V4 = SYSTEM_PROMPT_QWEN3_V2.replace(
+    "<tools>\n{", "<tools>\n[{", 1
+).replace("\n</tools>", f",\n{_ZOOM_OUT_SCHEMA}\n]</tools>", 1)
+
+USER_PROMPT_STEP1 = "\nThink first, call **image_zoom_in_tool** if needed, then answer. Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>...</answer> "
+USER_PROMPT_CUSTOM = """Ignore all previous thinking. You are shown an image I{I_idx}. For the question and the given label, think and call **image_zoom_in_tool** to output exactly one rectangular crop region R{R_idx} (bbox_2d) that best matches the question and label. If you output multiple regions, only the first will be used. The bbox_2d coordinates must be relative to the image you see (I{I_idx}).
+Format strictly as:  <think>...</think>  <tool_call>...</tool_call> """
+USER_PROMPT_STEP10_CROPS = """Based on the cropped region(s) shown above and the following thinking from previous steps:
+
+{think_summary}
+
+Review and give your final answer. Choose one option that best fits. Format strictly as:  <think>...</think>  <answer>...</answer> """
+USER_PROMPT_STEP10_NO_CROPS = "\nBased on your previous thinking, give your final answer. Format strictly as:  <think>...</think>  <answer>...</answer> "
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -79,12 +269,60 @@ def _jsonable(value: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
+    # pandas/pyarrow expose list-valued Parquet columns as numpy arrays.  Convert
+    # those before falling back to ``str`` so prediction JSON remains usable.
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return _jsonable(tolist())
+        except Exception:
+            pass
     return str(value)
+
+
+def _is_missing(value: Any) -> bool:
+    """Return whether *value* is an empty field without comparing arrays.
+
+    ``numpy.ndarray == None`` produces an array, and using that result in an
+    ``if`` raises the ambiguous-truth-value error seen for MathVista Parquet
+    records.  Keep this helper deliberately small and dependency-free.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, (bytes, bytearray)):
+        return len(value) == 0
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0
+    size = getattr(value, "size", None)
+    if size is not None:
+        try:
+            return int(size) == 0
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _as_sequence(value: Any) -> Optional[List[Any]]:
+    """Convert list-like scalar fields (including numpy arrays) to a list."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            converted = tolist()
+        except Exception:
+            return None
+        if isinstance(converted, (list, tuple)):
+            return list(converted)
+        return [converted]
+    return None
 
 
 def _first(record: Dict[str, Any], keys: Sequence[str], default: Any = None) -> Any:
     for key in keys:
-        if key in record and record[key] not in (None, ""):
+        if key in record and not _is_missing(record[key]):
             return record[key]
     return default
 
@@ -387,9 +625,10 @@ def _record_image(record: Dict[str, Any], root: Path, source: Optional[Path] = N
             except Exception:
                 pass
         value = value.get("path") or value.get("filename") or value.get("file_name")
-    if isinstance(value, list) and value:
-        value = value[0]
-    if not value:
+    sequence = _as_sequence(value)
+    if sequence is not None and sequence:
+        value = sequence[0]
+    if _is_missing(value):
         return None, None
     if isinstance(value, (bytes, bytearray)):
         return None, bytes(value)
@@ -446,16 +685,18 @@ def _normalise_record(record: Dict[str, Any], root: Path, source: Path) -> Optio
                 image_path = str(sibling)
                 break
     question = _first(record, QUESTION_KEYS, "")
-    if isinstance(question, (list, tuple)):
-        question = question[0] if question else ""
+    question_values = _as_sequence(question)
+    if question_values is not None:
+        question = question_values[0] if question_values else ""
     answer = _first(record, ANSWER_KEYS, "")
-    if isinstance(answer, (list, tuple)):
-        answer = answer[0] if answer else ""
+    answer_values = _as_sequence(answer)
+    if answer_values is not None:
+        answer = answer_values[0] if answer_values else ""
     if isinstance(answer, dict):
         answer = _first(answer, ("text", "value", "label", "answer"), json.dumps(answer, ensure_ascii=False))
     if not image_path and image_bytes is None:
         return None
-    if not question:
+    if _is_missing(question):
         question = str(record.get("instruction", record.get("caption", "")))
     if not str(question).strip():
         return None
@@ -609,19 +850,132 @@ def image_data_url(row: Dict[str, Any]) -> Optional[str]:
         return f"data:image/{_mime(str(path))};base64," + base64.b64encode(handle.read()).decode("ascii")
 
 
+IMAGE_FACTOR_DEFAULTS = {2: 28, 3: 32}
+MIN_PATCHES = 2
+MAX_PATCHES = 128
+
+
+def _image_limits(qwen_ver: int) -> Tuple[int, int, int]:
+    factor = IMAGE_FACTOR_DEFAULTS.get(int(qwen_ver), 32)
+    return factor, (MIN_PATCHES * factor) ** 2, (MAX_PATCHES * factor) ** 2
+
+
+def _round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _ceil_by_factor(number: float, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def _floor_by_factor(number: float, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def _smart_resize(
+    width: int,
+    height: int,
+    qwen_ver: int,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
+) -> Tuple[int, int]:
+    factor, default_min, default_max = _image_limits(qwen_ver)
+    min_pixels = default_min if min_pixels is None else int(min_pixels)
+    max_pixels = default_max if max_pixels is None else int(max_pixels)
+    h_bar = max(factor, _round_by_factor(height, factor))
+    w_bar = max(factor, _round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = _floor_by_factor(height / beta, factor)
+        w_bar = _floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = _ceil_by_factor(height * beta, factor)
+        w_bar = _ceil_by_factor(width * beta, factor)
+    return w_bar, h_bar
+
+
+def _pil_from_row(row: Dict[str, Any]) -> Optional[Any]:
+    if Image is None:
+        return None
+    raw = row.get("_image_bytes")
+    try:
+        if raw:
+            image = Image.open(io.BytesIO(raw))
+        elif row.get("image_path"):
+            image = Image.open(str(row["image_path"]))
+        else:
+            return None
+        image = image.convert("RGB") if image.mode in ("RGBA", "P") else image.convert("RGB")
+        return image.copy()
+    except Exception:
+        return None
+
+
+def _encode_pil_image(image: Any) -> str:
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode("ascii")
+
+
+def _image_content(image: Any, max_pixels: int, blank: bool = False) -> Dict[str, Any]:
+    url = "data:image/jpeg;base64," if blank else f"data:image/png;base64,{_encode_pil_image(image)}"
+    return {"type": "image_url", "image_url": {"url": url}, "max_pixels": int(max_pixels)}
+
+
+def _prompt_system(version: str, prompt_ver: int) -> str:
+    if version == "v0":
+        return SYSTEM_PROMPT_DEEPEYES
+    if int(prompt_ver) == 1:
+        return SYSTEM_PROMPT_DEEPEYES
+    if int(prompt_ver) == 2:
+        return SYSTEM_PROMPT_QWEN25_V4 if version == "v4" else SYSTEM_PROMPT_QWEN25_V2
+    return SYSTEM_PROMPT_QWEN3_V4 if version == "v4" else SYSTEM_PROMPT_QWEN3_V2
+
+
+def _question_prompt(record: Dict[str, Any]) -> Tuple[str, str]:
+    question = str(record.get("question", ""))
+    options = _options(record)
+    return question, options + "\n" if options else "\n"
+
+
+def _initial_messages(
+    image: Any,
+    question: str,
+    options_str: str,
+    version: str,
+    qwen_ver: int,
+    prompt_ver: int,
+    max_pixels: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    system_prompt = _prompt_system(version, prompt_ver)
+    prompt = f"Question: {question}\nOptions: {options_str}" + USER_PROMPT_STEP1
+    user_content = [_image_content(image, max_pixels), {"type": "text", "text": prompt}]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    print_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [_image_content(image, max_pixels, blank=True), {"type": "text", "text": prompt}]},
+    ]
+    return messages, print_messages
+
+
 def _strip_option_marker(value: Any) -> str:
     return re.sub(r"^\s*\(?[A-Z]\)?\s*[:.)]\s*", "", str(value))
 
 
 def _options(record: Dict[str, Any]) -> str:
     options = record.get("options", record.get("choices"))
-    if options in (None, ""):
+    if _is_missing(options):
         options = record.get("Answer choices", record.get("option"))
     if isinstance(options, dict):
         return "\n".join(f"{key}. {value}" for key, value in options.items())
-    if isinstance(options, (list, tuple)):
+    option_values = _as_sequence(options)
+    if option_values is not None:
         letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        return "\n".join(f"{letters[i]}. {_strip_option_marker(value)}" for i, value in enumerate(options))
+        return "\n".join(f"{letters[i]}. {_strip_option_marker(value)}" for i, value in enumerate(option_values))
     if isinstance(options, str):
         return options
     # A few MCQ releases store choices as A/B/C/D columns.
@@ -636,26 +990,10 @@ def _is_grounding(dataset: str, record: Dict[str, Any]) -> bool:
 
 
 def prompt_for(dataset: str, version: str, record: Dict[str, Any], qwen_ver: int) -> str:
-    question = record.get("question", "")
-    options = _options(record)
-    option_text = f"\nOptions:\n{options}" if options else ""
-    if _is_grounding(dataset, record):
-        output = "Return one bounding box in <answer>[x1, y1, x2, y2]</answer>. Use coordinates normalized to 0-1000 in the image currently shown."
-    elif DATASET_CONFIGS.get(dataset, {}).get("task") == "yes_no":
-        output = "Answer only yes or no inside <answer>...</answer>."
-    else:
-        output = "Give the final answer inside <answer>...</answer>. Keep it concise and preserve an option letter when the question is multiple choice."
-    if version == "v0":
-        reasoning = "Answer directly; do not emit a think block."
-    elif version == "v2":
-        reasoning = "Reason briefly, then emit <answer>...</answer>."
-    else:
-        reasoning = "Think step by step in <think>...</think>, then emit exactly one <answer>...</answer>."
-    qwen_note = "Qwen3-VL" if int(qwen_ver) == 3 else "Qwen2.5-VL"
-    return (
-        f"You are evaluating {DATASET_CONFIGS.get(dataset, {}).get('name', dataset)} with {qwen_note}.\n"
-        f"Question: {question}{option_text}\n{reasoning}\n{output}"
-    )
+    # Keep this public helper aligned with the HR-Bench initial user turn.  The
+    # version-specific system prompt is selected separately by _prompt_system.
+    question, options_str = _question_prompt(record)
+    return f"Question: {question}\nOptions: {options_str}" + USER_PROMPT_STEP1
 
 
 def _client(api_url: str, api_key: str):
@@ -675,16 +1013,26 @@ def _model_name(client: Any, requested: Optional[str]) -> str:
     return response.data[0].id
 
 
-def _call(client: Any, model: str, messages: List[Dict[str, Any]], max_tokens: int, retries: int = 3) -> str:
+def _call(
+    client: Any,
+    model: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: int,
+    retries: int = 3,
+    stop: Optional[List[str]] = None,
+) -> str:
     last_error: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            result = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=max_tokens,
-            )
+            request = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+            }
+            if stop:
+                request["stop"] = stop
+            result = client.chat.completions.create(**request)
             return (result.choices[0].message.content or "").strip()
         except Exception as exc:  # pragma: no cover - endpoint-dependent
             last_error = exc
@@ -697,58 +1045,406 @@ def _answer_from_response(text: str) -> str:
     return match.group(1).strip() if match else (text or "").strip()
 
 
-def _eval_one(client: Any, model: str, dataset: str, version: str, row: Dict[str, Any], qwen_ver: int, max_tokens: int) -> Dict[str, Any]:
-    data_url = image_data_url(row)
-    content: List[Dict[str, Any]] = []
-    if data_url:
-        content.append({"type": "image_url", "image_url": {"url": data_url}})
-    content.append({"type": "text", "text": prompt_for(dataset, version, row, qwen_ver)})
-    messages = [
-        {"role": "system", "content": "You are a careful visual question answering assistant."},
-        {"role": "user", "content": content},
-    ]
+_STOP_TOKENS = ["<|im_end|>", "</tool_call>"]
+
+
+def _crop_for_model(
+    image: Any,
+    bbox: Sequence[float],
+    qwen_ver: int,
+    max_pixels: int,
+) -> Tuple[Any, Tuple[int, int, int, int], int, int]:
+    width, height = image.size
+    left, top, right, bottom = [int(round(value)) for value in bbox]
+    left = max(0, min(left, width - 1))
+    top = max(0, min(top, height - 1))
+    right = max(left + 1, min(right, width))
+    bottom = max(top + 1, min(bottom, height))
+    crop = image.crop((left, top, right, bottom))
+    new_w, new_h = _smart_resize(right - left, bottom - top, qwen_ver, max_pixels=max_pixels)
+    crop = crop.resize((new_w, new_h), resample=Image.BICUBIC)
+    return crop, (left, top, right, bottom), new_w, new_h
+
+
+def _parse_bbox(response: str, image_bounds: Tuple[float, float, float, float]) -> Optional[List[float]]:
     try:
-        raw = _call(client, model, messages, max_tokens)
-        status = "success"
-        error = ""
+        bbox, _ = parse_first_bbox_from_response(response or "", image_bounds)
+        return list(bbox) if bbox is not None else None
+    except Exception:
+        return None
+
+
+def _run_zoom_loop(
+    client: Any,
+    model: str,
+    image: Any,
+    img_w: int,
+    img_h: int,
+    bbox_orig: Sequence[float],
+    label: str,
+    question: str,
+    options_str: str,
+    think_orig: str,
+    k_list: Sequence[float],
+    iou_thr: float,
+    expand_mode: str,
+    qwen_ver: int,
+    prompt_ver: int,
+    max_pixels: int,
+    version: str,
+    messages: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[float], List[str], List[Dict[str, Any]]]:
+    """Copy the HR-Bench v2/v4 zoom loop, with v4 history semantics."""
+    zoom_details: List[Dict[str, Any]] = []
+    a_bbox = list(bbox_orig)
+    q_opts = f"Question: {question}\nOptions: {options_str}\nLabel: {label}\n"
+    think_blocks = [think_orig]
+    w_i, h_i = float(img_w), float(img_h)
+    shared_history = messages if version == "v4" else None
+
+    for iter_idx, k_level in enumerate(k_list):
+        a_prev = list(a_bbox)
+        i_bbox = compute_I_level_bbox(a_prev, w_i, h_i, float(k_level), expand_mode)
+        i_l, i_t, i_r, i_b = [int(round(value)) for value in i_bbox]
+        i_l = max(0, min(i_l, img_w - 1))
+        i_t = max(0, min(i_t, img_h - 1))
+        i_r = max(i_l + 1, min(i_r, img_w))
+        i_b = max(i_t + 1, min(i_b, img_h))
+        crop = image.crop((i_l, i_t, i_r, i_b))
+        crop_max_pixels = int(max_pixels * (float(k_level) ** 2))
+        new_w, new_h = _smart_resize(i_r - i_l, i_b - i_t, qwen_ver, max_pixels=crop_max_pixels)
+        crop = crop.resize((new_w, new_h), resample=Image.BICUBIC)
+
+        if shared_history is None:
+            loop_messages = [
+                {"role": "system", "content": _prompt_system(version, prompt_ver)},
+                {"role": "user", "content": [
+                    _image_content(crop, crop_max_pixels),
+                    {"type": "text", "text": q_opts + USER_PROMPT_CUSTOM.format(I_idx=iter_idx + 1, R_idx=iter_idx + 2)},
+                ]},
+            ]
+        else:
+            loop_messages = shared_history
+            ratio_w = 1000.0 / img_w if int(qwen_ver) == 3 else 1.0
+            ratio_h = 1000.0 / img_h if int(qwen_ver) == 3 else 1.0
+            loop_messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": f"Centered around R{iter_idx + 1}, call **image_zoom_out_tool** to output I{iter_idx + 1}, whose area is approximately {float(k_level) ** 2} times that of the original image."}],
+            })
+            loop_messages.append({
+                "role": "assistant",
+                "content": f'<tool_call>{{"name": "image_zoom_out_tool", "arguments": {{"bbox_2d": [{int(i_l * ratio_w)}, {int(i_t * ratio_h)}, {int(i_r * ratio_w)}, {int(i_b * ratio_h)}], "index": "I{iter_idx + 1}"}}}}</tool_call>',
+            })
+            loop_messages.append({
+                "role": "user",
+                "content": [
+                    _image_content(crop, crop_max_pixels),
+                    {"type": "text", "text": q_opts + USER_PROMPT_CUSTOM.format(I_idx=iter_idx + 1, R_idx=iter_idx + 2)},
+                ],
+            })
+
+        try:
+            response_message = _call(client, model, loop_messages, 4096, retries=1, stop=_STOP_TOKENS)
+        except Exception:
+            response_message = ""
+        if shared_history is not None:
+            shared_history.append({"role": "assistant", "content": response_message})
+
+        think_blocks.append(extract_think_blocks(response_message))
+        model_w, model_h = (1000.0, 1000.0) if int(qwen_ver) == 3 else (float(new_w), float(new_h))
+        bbox_local = _parse_bbox(response_message, (0, 0, model_w, model_h))
+        if bbox_local is None:
+            bbox_local = [0.0, 0.0, model_w, model_h]
+        scale_w, scale_h = (i_r - i_l) / model_w, (i_b - i_t) / model_h
+        a_bbox = [
+            bbox_local[0] * scale_w + i_l,
+            bbox_local[1] * scale_h + i_t,
+            bbox_local[2] * scale_w + i_l,
+            bbox_local[3] * scale_h + i_t,
+        ]
+        a_bbox = clamp_bbox_to_image(a_bbox, w_i, h_i)
+        iou_val = compute_iou(a_prev, a_bbox)
+        zoom_details.append({
+            "iter": iter_idx + 1,
+            "A_prev": a_prev,
+            "I_bbox": i_bbox,
+            "A_bbox": a_bbox,
+            "iou": iou_val,
+            "response": response_message,
+        })
+        if iou_val > iou_thr:
+            break
+
+    final_bbox = bbox_min_envelope_multi([a_prev, a_bbox]) if k_list else list(a_bbox)
+    return final_bbox, think_blocks[-2:], zoom_details
+
+
+def _run_v0_trace(
+    client: Any,
+    model: str,
+    image: Any,
+    question: str,
+    options_str: str,
+    qwen_ver: int,
+    prompt_ver: int,
+    max_pixels: int,
+) -> Dict[str, Any]:
+    width, height = image.size
+    resize_w, resize_h = _smart_resize(width, height, qwen_ver)
+    resized = image.resize((resize_w, resize_h), resample=Image.BICUBIC)
+    model_w, model_h = (1000.0, 1000.0) if int(qwen_ver) == 3 else (float(resize_w), float(resize_h))
+    width_scale, height_scale = width / model_w, height / model_h
+    messages, print_messages = _initial_messages(resized, question, options_str, "v0", qwen_ver, prompt_ver, max_pixels)
+    response_message = ""
+    status = "success"
+    screened_regions: List[Tuple[List[float], str]] = []
+    try:
+        try_count = 0
+        while "</answer>" not in response_message and try_count <= 10:
+            response_message = _call(client, model, messages, 8192, retries=1, stop=_STOP_TOKENS)
+            print_messages.append({"role": "assistant", "content": response_message, "meta": "step1_or_tool_response"})
+            messages.append({"role": "assistant", "content": response_message})
+            if "<tool_call>" in response_message:
+                bbox = _parse_bbox(response_message, (0, 0, model_w, model_h))
+                if bbox is not None:
+                    screened_regions = [(bbox, "")]
+                    crop, _, _, _ = _crop_for_model(
+                        image,
+                        [bbox[0] * width_scale, bbox[1] * height_scale, bbox[2] * width_scale, bbox[3] * height_scale],
+                        qwen_ver,
+                        max_pixels,
+                    )
+                    content = [
+                        {"type": "text", "text": "<tool_response>"},
+                        _image_content(crop, max_pixels),
+                        {"type": "text", "text": USER_PROMPT_STEP1},
+                        {"type": "text", "text": "</tool_response>"},
+                    ]
+                    messages.append({"role": "user", "content": content})
+                    print_messages.append({"role": "user", "content": USER_PROMPT_STEP1, "meta": "tool_response_crop"})
+            try_count += 1
     except Exception as exc:
-        raw = ""
         status = "error"
-        error = repr(exc)
+        print_messages.append({"role": "error", "content": repr(exc)})
     return {
+        "response": response_message,
+        "messages": messages,
+        "print_messages": print_messages,
+        "screened_regions": screened_regions,
+        "final_regions": [],
+        "zoom_details": [],
+        "status": status,
+    }
+
+
+def _run_v2_v4_trace(
+    client: Any,
+    model: str,
+    image: Any,
+    question: str,
+    options_str: str,
+    version: str,
+    qwen_ver: int,
+    prompt_ver: int,
+    k: float,
+    iou_thr: float,
+    max_iter: int,
+    max_level: int,
+    expand_mode: str,
+    max_pixels: int,
+) -> Dict[str, Any]:
+    width, height = image.size
+    resize_w, resize_h = _smart_resize(width, height, qwen_ver)
+    resized = image.resize((resize_w, resize_h), resample=Image.BICUBIC)
+    messages, print_messages = _initial_messages(resized, question, options_str, version, qwen_ver, prompt_ver, max_pixels)
+    response_message = ""
+    status = "success"
+    screened_regions: List[Tuple[List[float], str]] = []
+    final_regions: List[Tuple[List[float], str]] = []
+    all_zoom_details: List[Dict[str, Any]] = []
+    think_blocks_for_step10: List[str] = []
+    try:
+        try:
+            response_message = _call(client, model, messages, 8192, retries=1, stop=_STOP_TOKENS)
+        except Exception:
+            response_message = ""
+        messages.append({"role": "assistant", "content": response_message})
+        think_orig = extract_think_blocks(response_message)
+        print_messages.append({"role": "assistant", "content": response_message, "meta": "step1_think_and_tool_calls"})
+        initial_w, initial_h = (1000.0, 1000.0) if int(qwen_ver) == 3 else (float(resize_w), float(resize_h))
+        screened_regions = screen_tool_call_regions(response_message, (0, 0, initial_w, initial_h))
+        print_messages.append({
+            "role": "user",
+            "content": "[Chain step 2] Screening: retained {} region(s). Regions: {}".format(
+                len(screened_regions), json.dumps([{"bbox_2d": b, "label": l} for b, l in screened_regions])
+            ),
+            "meta": "step2_screening",
+        })
+        k_list = [float(k) ** (level + 1) for _ in range(max(0, int(max_iter))) for level in range(max(0, int(max_level)))]
+        for zoom_idx, (bbox, label) in enumerate(screened_regions):
+            scale_w, scale_h = width / initial_w, height / initial_h
+            bbox_orig = [bbox[0] * scale_w, bbox[1] * scale_h, bbox[2] * scale_w, bbox[3] * scale_h]
+            final_bbox, think_blocks, zoom_details = _run_zoom_loop(
+                client, model, image, width, height, bbox_orig, label, question, options_str,
+                think_orig, k_list, iou_thr, expand_mode, qwen_ver, prompt_ver, max_pixels,
+                version, messages if version == "v4" else None,
+            )
+            final_regions.append((final_bbox, label))
+            all_zoom_details.append({"label": label, "zoom_details": zoom_details})
+            think_blocks_for_step10.extend(think_blocks)
+            for iter_idx, detail in enumerate(zoom_details):
+                print_messages.append({"role": "assistant", "content": detail.get("response", ""), "meta": f"step7_zoom{zoom_idx + 1}_iter{iter_idx + 1}"})
+
+        if final_regions:
+            think_summary = "\n---\n".join(text for text in think_blocks_for_step10 if text.strip())
+            crop_contents = []
+            for bbox, _ in final_regions:
+                crop, _, _, _ = _crop_for_model(image, bbox, qwen_ver, max_pixels)
+                crop_contents.append(_image_content(crop, max_pixels))
+            final_prompt = USER_PROMPT_STEP10_CROPS.format(think_summary=think_summary)
+            final_content = [{"type": "text", "text": "<tool_response>"}, *crop_contents, {"type": "text", "text": final_prompt}, {"type": "text", "text": "</tool_response>"}]
+            messages.append({"role": "user", "content": final_content})
+            print_messages.append({"role": "user", "content": final_prompt, "meta": "step10_crops"})
+        elif "<answer>" not in response_message or "</answer>" not in response_message:
+            messages.append({"role": "user", "content": USER_PROMPT_STEP10_NO_CROPS})
+            print_messages.append({"role": "user", "content": USER_PROMPT_STEP10_NO_CROPS, "meta": "step10_no_crops"})
+
+        if final_regions or "<answer>" not in response_message or "</answer>" not in response_message:
+            for _ in range(max(1, int(max_iter))):
+                try:
+                    response_message = _call(client, model, messages, 8192, retries=1, stop=_STOP_TOKENS)
+                except Exception:
+                    response_message = ""
+                print_messages.append({"role": "assistant", "content": response_message, "meta": "step10_answer"})
+                messages.append({"role": "assistant", "content": response_message})
+                if "<answer>" in response_message and "</answer>" in response_message:
+                    break
+    except Exception as exc:
+        status = "error"
+        print_messages.append({"role": "error", "content": repr(exc)})
+    return {
+        "response": response_message,
+        "messages": messages,
+        "print_messages": print_messages,
+        "screened_regions": screened_regions,
+        "final_regions": final_regions,
+        "zoom_details": all_zoom_details,
+        "status": status,
+    }
+
+
+_POPE_CATEGORIES = ("adversarial", "popular", "random")
+
+
+def _pope_category(value: Any) -> str:
+    """Return POPE's normalized subset name when it is present in a row/item."""
+    if not isinstance(value, dict):
+        return ""
+    candidate_dicts = [value]
+    nested_record = value.get("record")
+    if isinstance(nested_record, dict):
+        candidate_dicts.append(nested_record)
+    candidates: List[Any] = []
+    for candidate_dict in candidate_dicts:
+        candidates.append(candidate_dict.get("pope_category"))
+        for key in (
+            "category", "subset", "split", "partition", "type", "sampling",
+            "setting", "source", "file_name", "filename", "_source",
+        ):
+            candidates.append(candidate_dict.get(key))
+        # Nested metadata is common in Parquet exports.
+        metadata = candidate_dict.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.extend(metadata.get(key) for key in ("category", "subset", "split", "type", "setting"))
+    for candidate in candidates:
+        if _is_missing(candidate):
+            continue
+        text = str(candidate).lower().replace("_", "-")
+        for category in _POPE_CATEGORIES:
+            if re.search(rf"(?<![a-z]){re.escape(category)}(?![a-z])", text):
+                return category
+    return ""
+
+
+def _eval_one(
+    client: Any,
+    model: str,
+    dataset: str,
+    version: str,
+    row: Dict[str, Any],
+    qwen_ver: int,
+    max_tokens: int,
+    runtime: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    runtime = runtime or {}
+    image = _pil_from_row(row)
+    question, options_str = _question_prompt(row)
+    if image is None:
+        trace = {"response": "", "print_messages": [], "screened_regions": [], "final_regions": [], "zoom_details": [], "status": "error"}
+    elif version == "v0":
+        _, _, max_pixels = _image_limits(qwen_ver)
+        trace = _run_v0_trace(client, model, image, question, options_str, qwen_ver, int(runtime.get("prompt_ver", 3)), max_pixels)
+    else:
+        _, _, max_pixels = _image_limits(qwen_ver)
+        trace = _run_v2_v4_trace(
+            client, model, image, question, options_str, version, qwen_ver,
+            int(runtime.get("prompt_ver", 3)), float(runtime.get("k", 0.4)), float(runtime.get("iou_thr", 0.5)),
+            int(runtime.get("max_iter", 4)), int(runtime.get("max_level", 1)), str(runtime.get("expand_mode", "quarter")), max_pixels,
+        )
+    response = trace.get("response", "")
+    result = {
         "id": row.get("id", row.get("question_id", row.get("pid", ""))),
         "image": row.get("image_path"),
         "question": row.get("question", ""),
         "answer": _jsonable(row.get("answer", "")),
-        "pred_ans": _answer_from_response(raw),
-        "pred_output": raw,
-        "status": status,
-        "error": error,
+        "pred_ans": _answer_from_response(response),
+        "pred_output": trace.get("print_messages", []),
+        "screened_regions": [{"bbox_2d": b, "label": l} for b, l in trace.get("screened_regions", [])],
+        "final_regions": [{"bbox_2d": b, "label": l} for b, l in trace.get("final_regions", [])],
+        "zoom_details": trace.get("zoom_details", []),
+        "status": trace.get("status", "success"),
+        "error": "" if trace.get("status") == "success" else "evaluation failed",
         "qwen_ver": int(qwen_ver),
         "version": version,
         "record": _jsonable({k: v for k, v in row.items() if not k.startswith("_")}),
     }
+    # POPE is released as three logical subsets.  The subset is sometimes an
+    # explicit annotation field and sometimes only present in the source
+    # filename, so keep the normalized value in each prediction for judging.
+    if dataset == "pope":
+        result["pope_category"] = _pope_category(row)
+    return result
 
 
 def _add_common_eval_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset_path", "--data_path", required=True)
-    parser.add_argument("--save_path", required=True)
-    parser.add_argument("--model_name", default="qwen-vl")
-    parser.add_argument("--eval_model_name", default=None)
-    parser.add_argument("--api_key", default="EMPTY")
-    parser.add_argument("--api_url", default="http://127.0.0.1:8000/v1")
+    parser.add_argument("--dataset_path", "--data_path", "--hrbench_path", dest="dataset_path", default=None)
+    parser.add_argument("--save_path", default=None)
+    parser.add_argument("--model_name", type=str, default="qwen", help="Model name for result save")
+    parser.add_argument("--eval_model_name", type=str, default=None, help="Model name for evaluation")
+    parser.add_argument("--api_key", type=str, default="EMPTY", help="API key")
+    parser.add_argument("--api_url", type=str, default="http://10.39.19.140:8000/v1", help="API URL")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--split", default=None, help="Optional official split name, for example testmini or test")
     parser.add_argument("--problem_version", default=None, help="MathVerse version, for example Vision Only")
-    parser.add_argument("--qwen_ver", type=int, choices=(2, 3), default=3)
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--qwen_ver", type=int, default=3, help="qwen version")
+    parser.add_argument("--prompt_ver", type=int, default=3, help="1: deepeyes; 2: qwen2.5-vl; 3: qwen3-vl")
+    parser.add_argument("--k", type=float, default=0.4, help="Zoom loop parameter k")
+    parser.add_argument("--iou_thr", type=float, default=0.5, help="IoU threshold for zoom loop convergence")
+    parser.add_argument("--max_iter", type=int, default=4, help="Max zoom loop iterations")
+    parser.add_argument("--max_level", type=int, default=1, help="Max zoom level per iteration")
+    parser.add_argument("--expand_mode", type=str, default="quarter", help="I{level} construction: 'bbox', 'ctr', or 'quarter' (default)")
+    parser.add_argument("--max_tokens", type=int, default=8192)
 
 
 def main_eval(dataset: str, version: str, argv: Optional[Sequence[str]] = None, default_problem_version: Optional[str] = None) -> Path:
     parser = argparse.ArgumentParser(description=f"Evaluate {DATASET_CONFIGS.get(dataset, {}).get('name', dataset)} ({version})")
     _add_common_eval_args(parser)
     args = parser.parse_args(argv)
+    if not args.dataset_path:
+        parser.error("one of --dataset_path/--data_path/--hrbench_path is required")
+    if not args.save_path:
+        parser.error("--save_path is required")
     problem_version = args.problem_version or default_problem_version
     # Filtering must happen before truncation.  In particular, the first rows
     # of MathVerse are Text Dominant, so applying --max_samples while loading
@@ -771,15 +1467,60 @@ def main_eval(dataset: str, version: str, argv: Optional[Sequence[str]] = None, 
     results: List[Dict[str, Any]] = []
     workers = max(1, min(int(args.num_workers), len(rows)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_eval_one, client, model, dataset, version, row, args.qwen_ver, args.max_tokens) for row in rows]
-        for future in as_completed(futures):
-            results.append(future.result())
+        runtime = {
+            "prompt_ver": args.prompt_ver,
+            "k": args.k,
+            "iou_thr": args.iou_thr,
+            "max_iter": args.max_iter,
+            "max_level": args.max_level,
+            "expand_mode": args.expand_mode,
+        }
+        futures = [pool.submit(_eval_one, client, model, dataset, version, row, args.qwen_ver, args.max_tokens, runtime) for row in rows]
+        completed = 0
+        future_iter: Iterable[Any] = as_completed(futures)
+        progress = None
+        if tqdm is not None:
+            progress = tqdm(
+                future_iter,
+                total=len(futures),
+                desc=f"Evaluating {dataset} {version}",
+                unit="sample",
+                dynamic_ncols=True,
+            )
+            future_iter = progress
+        try:
+            for future in future_iter:
+                results.append(future.result())
+                if progress is None:
+                    completed += 1
+                    print(
+                        f"\rEvaluating {dataset} {version}: {completed}/{len(futures)} samples",
+                        end="",
+                        flush=True,
+                    )
+        finally:
+            if progress is not None:
+                progress.close()
+            elif futures:
+                print()
     # Keep deterministic order for judge scripts and comparison between versions.
     results.sort(key=lambda x: str(x.get("id", "")) + str(x.get("image", "")))
     with output_file.open("w", encoding="utf-8") as handle:
         for result in results:
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-    metadata = {"dataset": dataset, "version": version, "model": model, "qwen_ver": args.qwen_ver, "count": len(results)}
+    metadata = {
+        "dataset": dataset,
+        "version": version,
+        "model": model,
+        "qwen_ver": args.qwen_ver,
+        "prompt_ver": args.prompt_ver,
+        "k": args.k,
+        "iou_thr": args.iou_thr,
+        "max_iter": args.max_iter,
+        "max_level": args.max_level,
+        "expand_mode": args.expand_mode,
+        "count": len(results),
+    }
     (output_dir / f"metadata_{version}.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(f"Saved {len(results)} predictions to {output_file}")
     return output_file
@@ -796,9 +1537,10 @@ def _clean_answer(value: Any) -> str:
 
 
 def _answer_options(value: Any) -> List[str]:
-    if isinstance(value, (list, tuple)):
-        return [str(v) for v in value]
-    return [str(value)] if value not in (None, "") else []
+    values = _as_sequence(value)
+    if values is not None:
+        return [str(v) for v in values]
+    return [str(value)] if not _is_missing(value) else []
 
 
 def _choice_set(value: Any) -> Optional[frozenset[str]]:
@@ -822,15 +1564,16 @@ def _exact_match(pred: Any, truth: Any, record: Dict[str, Any], dataset: str) ->
             if predicted_choices == _choice_set(truth_value):
                 return True
     options = record.get("options", record.get("choices"))
-    if options in (None, ""):
+    if _is_missing(options):
         options = record.get("Answer choices", record.get("option"))
     if isinstance(options, str):
         parsed = re.findall(r"(?:^|[;\n])\s*\(?([A-Z])\)?\s*[:.)]\s*([^;\n]+)", options, flags=re.I)
         if parsed:
             options = [value.strip() for _, value in parsed]
-    if isinstance(options, (list, tuple)):
+    option_values = _as_sequence(options)
+    if option_values is not None:
         letters = "abcdefghijklmnopqrstuvwxyz"
-        for idx, option in enumerate(options):
+        for idx, option in enumerate(option_values):
             option_clean = _clean_answer(_strip_option_marker(option))
             if p == letters[idx] or p.startswith(letters[idx] + ".") or p == option_clean or option_clean and option_clean in p:
                 if any(
@@ -851,9 +1594,10 @@ def _exact_match(pred: Any, truth: Any, record: Dict[str, Any], dataset: str) ->
 
 
 def _numbers(value: Any) -> Optional[List[float]]:
-    if isinstance(value, (list, tuple)) and len(value) >= 4:
+    values = _as_sequence(value)
+    if values is not None and len(values) >= 4:
         try:
-            return [float(x) for x in list(value)[:4]]
+            return [float(x) for x in values[:4]]
         except (TypeError, ValueError):
             return None
     if isinstance(value, dict):
@@ -997,6 +1741,29 @@ def main_judge(dataset: str, argv: Optional[Sequence[str]] = None) -> Path:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     summary = {"dataset": dataset, "prediction_file": str(prediction), "count": len(results), "accuracy": score}
     if dataset == "pope":
+        pope_category_scores: Dict[str, List[float]] = {category: [] for category in _POPE_CATEGORIES}
+        for item in results:
+            category = _pope_category(item)
+            if category in pope_category_scores:
+                pope_category_scores[category].append(float(item.get("score", 0.0)))
+        pope_metrics = {
+            category.title(): {
+                "accuracy": sum(values) / max(len(values), 1),
+                "count": len(values),
+            }
+            for category, values in pope_category_scores.items()
+        }
+        # Keep the four official POPE subset indicators as top-level fields so
+        # they are easy to consume from the JSON summary and shell scripts.
+        summary.update(
+            {
+                "Adversarial": pope_metrics["Adversarial"]["accuracy"],
+                "Popular": pope_metrics["Popular"]["accuracy"],
+                "Random": pope_metrics["Random"]["accuracy"],
+                "Overall": score,
+                "pope_metrics": pope_metrics,
+            }
+        )
         tp = fp = fn = tn = 0
         for item in results:
             truth_text = _clean_answer(item.get("answer", ""))

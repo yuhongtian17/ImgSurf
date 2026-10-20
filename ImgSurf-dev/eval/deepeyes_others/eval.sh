@@ -13,6 +13,12 @@ API_KEY="${API_KEY:-replace-with-a-long-random-key}"
 API_URL="${API_URL:-http://127.0.0.1:18938/v1}"
 EVAL_MODEL_NAME="${EVAL_MODEL_NAME:-${MODEL_NAME}}"
 QWEN_VER="${QWEN_VER:-3}"
+PROMPT_VER="${PROMPT_VER:-3}"
+ZOOM_K="${ZOOM_K:-0.4}"
+IOU_THR="${IOU_THR:-0.5}"
+MAX_ITER="${MAX_ITER:-4}"
+MAX_LEVEL="${MAX_LEVEL:-1}"
+EXPAND_MODE="${EXPAND_MODE:-quarter}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 DATASET="${DATASET:-all}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
@@ -59,6 +65,12 @@ for dataset in "${DATASETS[@]}"; do
     --num_workers "${NUM_WORKERS}" \
     --max_samples "${MAX_SAMPLES}" \
     --qwen_ver "${QWEN_VER}" \
+    --prompt_ver "${PROMPT_VER}" \
+    --k "${ZOOM_K}" \
+    --iou_thr "${IOU_THR}" \
+    --max_iter "${MAX_ITER}" \
+    --max_level "${MAX_LEVEL}" \
+    --expand_mode "${EXPAND_MODE}" \
     "${split_args[@]}"
   python "${judge_script}" \
     --model_name "${MODEL_NAME}" \
