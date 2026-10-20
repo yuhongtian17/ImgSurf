@@ -1,0 +1,14 @@
+"""mathverse_vision v0 evaluation entry point."""
+from pathlib import Path
+import sys
+
+try:
+    from eval.deepeyes_others.common_eval import main_eval
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from deepeyes_others.common_eval import main_eval
+
+if __name__ == "__main__":
+    main_eval("mathverse_vision", "v0", default_problem_version="Vision Only")
+
+
